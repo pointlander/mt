@@ -7,20 +7,28 @@ package main
 import "math"
 
 const (
-	// order is the Markov conditioning width, in bytes.
+	// order is the longest Markov conditioning width, in bytes.
+	// Contexts of length order-1 down to 1 are stored too and used on a miss.
 	order = 4
 	// vocab is the byte alphabet.
 	vocab = 256
 	// alpha is the additive count mixed into every next-byte bin.
-	// It is small so a repeated 4-gram stays peaked, and large enough
+	// It is small so a repeated context stays peaked, and large enough
 	// that an unseen byte still has positive probability.
 	alpha = 0.01
 	// stride is the spacing between distributions fed to the transformer.
-	// It matches the Markov order so successive inputs read disjoint 4-grams.
+	// It matches the longest Markov order so successive inputs read disjoint 4-grams.
 	stride = 4
 )
 
+// markovKey is the order-4 context used by callers. Shorter lookups use its suffix.
 type markovKey [order]byte
+
+// ctxKey is a context of length n. b[:n] holds the bytes from oldest to newest.
+type ctxKey struct {
+	n byte
+	b [order]byte
+}
 
 type markovEntry struct {
 	sym   []byte
@@ -28,104 +36,142 @@ type markovEntry struct {
 	total uint32
 }
 
-// Markov is a 4th-order next-byte model. Distributions use additive smoothing.
+func (e *markovEntry) count(sym byte) uint32 {
+	for i, s := range e.sym {
+		if s == sym {
+			return e.cnt[i]
+		}
+	}
+	return 0
+}
+
+// Markov is a next-byte model over contexts of 4, 3, 2, and 1 bytes.
+// A lookup uses the longest context that was actually counted, then the next
+// shorter suffix. Distributions use additive smoothing.
 type Markov struct {
-	tab          map[markovKey]*markovEntry
+	tab          map[ctxKey]*markovEntry
 	observations int
 }
 
 func newMarkov() *Markov {
-	return &Markov{tab: make(map[markovKey]*markovEntry, 1<<16)}
+	return &Markov{tab: make(map[ctxKey]*markovEntry, 1<<17)}
 }
 
-// Observe records one transition ctx -> next.
-func (m *Markov) Observe(ctx markovKey, next byte) {
-	e := m.tab[ctx]
+func suffixKey(ctx markovKey, n int) ctxKey {
+	var k ctxKey
+	k.n = byte(n)
+	copy(k.b[:n], ctx[order-n:])
+	return k
+}
+
+func (m *Markov) observe(key ctxKey, next byte) {
+	e := m.tab[key]
 	if e == nil {
 		e = &markovEntry{}
-		m.tab[ctx] = e
+		m.tab[key] = e
 	}
 	for i, s := range e.sym {
 		if s == next {
 			e.cnt[i]++
 			e.total++
-			m.observations++
 			return
 		}
 	}
 	e.sym = append(e.sym, next)
 	e.cnt = append(e.cnt, 1)
 	e.total++
-	m.observations++
 }
 
-// Train counts every order-4 transition in data[0:end].
+// Train counts next-byte transitions for every context length from 1 through order.
 func (m *Markov) Train(data []byte, end int) {
 	if end > len(data) {
 		end = len(data)
 	}
-	var ctx markovKey
-	for i := order; i < end; i++ {
-		copy(ctx[:], data[i-order:i])
-		m.Observe(ctx, data[i])
+	for i := 1; i < end; i++ {
+		nctx := i
+		if nctx > order {
+			nctx = order
+		}
+		var ctx markovKey
+		copy(ctx[order-nctx:], data[i-nctx:i])
+		next := data[i]
+		for n := nctx; n >= 1; n-- {
+			m.observe(suffixKey(ctx, n), next)
+		}
+	}
+	if end > 1 {
+		m.observations += end - 1
 	}
 }
 
-func (m *Markov) entryCounts(ctx markovKey, target byte, loo bool) (total uint32, targetCount uint32, best byte, bestCount uint32, seen bool) {
-	e := m.tab[ctx]
-	if e == nil {
-		return 0, 0, 0, 0, false
+// Orders returns the number of stored contexts of length 4, 3, 2, and 1.
+func (m *Markov) Orders() (n4, n3, n2, n1 int) {
+	for k := range m.tab {
+		switch k.n {
+		case 4:
+			n4++
+		case 3:
+			n3++
+		case 2:
+			n2++
+		case 1:
+			n1++
+		}
 	}
-	total = e.total
-	if loo {
-		if total == 0 {
-			panic("leave-one-out on an empty context")
-		}
-		total--
-	}
-	for i, s := range e.sym {
-		c := e.cnt[i]
-		if loo && s == target {
-			if c == 0 {
-				panic("leave-one-out missing the target")
-			}
-			c--
-		}
-		if s == target {
-			targetCount = c
-		}
-		if c == 0 {
+	return n4, n3, n2, n1
+}
+
+// resolve picks the context distribution for ctx. A length misses when it was
+// never stored. Leave-one-out also misses when removing target drops the last
+// count, and the search continues with the next shorter suffix.
+func (m *Markov) resolve(ctx markovKey, target byte, loo bool) (e *markovEntry, drop bool) {
+	for n := order; n >= 1; n-- {
+		e = m.tab[suffixKey(ctx, n)]
+		if e == nil {
 			continue
 		}
-		if !seen || c > bestCount || (c == bestCount && s < best) {
-			best = s
-			bestCount = c
-			seen = true
+		if !loo {
+			return e, false
 		}
+		c := e.count(target)
+		if c == 0 {
+			return e, false
+		}
+		if e.total <= 1 {
+			continue
+		}
+		return e, true
 	}
-	return total, targetCount, best, bestCount, seen
+	return nil, false
 }
 
 // Dist writes P(next | ctx). If loo is set, one count of target is removed
-// so the label being predicted is not inside its own input distribution.
+// from the context that supplies the distribution, so the label being
+// predicted is not inside its own input distribution.
 func (m *Markov) Dist(ctx markovKey, target byte, loo bool, out []float32) {
 	if len(out) != vocab {
 		panic("dist length")
 	}
-	total, _, _, _, _ := m.entryCounts(ctx, target, loo)
+	e, drop := m.resolve(ctx, target, loo)
+	var total uint32
+	if e != nil {
+		total = e.total
+		if drop {
+			total--
+		}
+	}
 	denom := float32(total) + alpha*float32(vocab)
 	base := alpha / denom
 	for i := range out {
 		out[i] = base
 	}
-	e := m.tab[ctx]
 	if e == nil {
 		return
 	}
 	inv := 1 / denom
 	for i, s := range e.sym {
 		c := e.cnt[i]
-		if loo && s == target {
+		if drop && s == target {
 			c--
 		}
 		out[s] = (float32(c) + alpha) * inv
@@ -135,7 +181,35 @@ func (m *Markov) Dist(ctx markovKey, target byte, loo bool, out []float32) {
 // Score returns P(target | ctx) and whether target is the mode.
 // Ties break toward the smaller byte. An all-tied row predicts byte 0.
 func (m *Markov) Score(ctx markovKey, target byte, loo bool) (p float32, hit bool) {
-	total, targetCount, best, _, seen := m.entryCounts(ctx, target, loo)
+	e, drop := m.resolve(ctx, target, loo)
+	var total uint32
+	var targetCount uint32
+	best := byte(0)
+	var bestCount uint32
+	seen := false
+	if e != nil {
+		total = e.total
+		if drop {
+			total--
+		}
+		for i, s := range e.sym {
+			c := e.cnt[i]
+			if drop && s == target {
+				c--
+			}
+			if s == target {
+				targetCount = c
+			}
+			if c == 0 {
+				continue
+			}
+			if !seen || c > bestCount || (c == bestCount && s < best) {
+				best = s
+				bestCount = c
+				seen = true
+			}
+		}
+	}
 	denom := float32(total) + alpha*float32(vocab)
 	p = (float32(targetCount) + alpha) / denom
 	if !seen {

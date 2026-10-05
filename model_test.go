@@ -148,6 +148,65 @@ func TestMarkovBasic(t *testing.T) {
 	}
 }
 
+func TestMarkovBackoff(t *testing.T) {
+	m := newMarkov()
+	var data []byte
+	for i := 0; i < 20; i++ {
+		data = append(data, []byte("hello")...)
+	}
+	m.Train(data, len(data))
+	n4, n3, n2, n1 := m.Orders()
+	if n4 == 0 || n3 == 0 || n2 == 0 || n1 == 0 {
+		t.Fatalf("missing orders 4=%d 3=%d 2=%d 1=%d", n4, n3, n2, n1)
+	}
+
+	// "xell" was never counted, but the suffix "ell" predicts 'o'.
+	var ctx markovKey
+	copy(ctx[:], []byte("xell"))
+	p, hit := m.Score(ctx, 'o', false)
+	want := float32(20+alpha) / float32(20+alpha*vocab)
+	if !hit || math.Abs(float64(p-want)) > 1e-5 {
+		t.Fatalf("backoff to order 3: p=%g hit=%v want %g", p, hit, want)
+	}
+
+	// Orders 4 and 3 miss. "ab" always continues with 'X', while "b" also
+	// continues with 'Y', so a correct backoff stops at width 2.
+	m2 := newMarkov()
+	var mixed []byte
+	for i := 0; i < 10; i++ {
+		mixed = append(mixed, []byte("abXcbY")...)
+	}
+	m2.Train(mixed, len(mixed))
+	copy(ctx[:], []byte("zzab"))
+	p, hit = m2.Score(ctx, 'X', false)
+	want = float32(10+alpha) / float32(10+alpha*vocab)
+	if !hit || math.Abs(float64(p-want)) > 1e-5 {
+		t.Fatalf("backoff to order 2: p=%g hit=%v want %g", p, hit, want)
+	}
+
+	// Order 4 is a singleton, so leave-one-out falls through to the shared suffix.
+	back := newMarkov()
+	text := []byte("WaaaXZaaaX")
+	back.Train(text, len(text))
+	copy(ctx[:], []byte("Waaa"))
+	p, hit = back.Score(ctx, 'X', true)
+	// "aaa" -> 'X' twice. Dropping this event leaves one.
+	want = float32(1+alpha) / float32(1+alpha*vocab)
+	if !hit || math.Abs(float64(p-want)) > 1e-5 {
+		t.Fatalf("loo backoff p=%g hit=%v want %g", p, hit, want)
+	}
+
+	// A context that was never seen at any width is uniform.
+	copy(ctx[:], []byte("zzzz"))
+	uniform := make([]float32, vocab)
+	back.Dist(ctx, 'q', false, uniform)
+	for i, v := range uniform {
+		if math.Abs(float64(v-1.0/vocab)) > 1e-5 {
+			t.Fatalf("unseen context bin %d = %g", i, v)
+		}
+	}
+}
+
 func TestWindows(t *testing.T) {
 	s0, n := countWindows(100, 0, 80, 3, 4)
 	if s0 != 0 || n != 17 {

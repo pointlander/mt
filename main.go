@@ -4,7 +4,8 @@
 
 // mt trains two next-byte models on pg100.txt.
 //
-// The Markov model is order 4 over raw bytes. At byte s, s+4, s+8, ... it
+// The Markov model counts next-byte contexts of 4, 3, 2, and 1 bytes, and a
+// missed lookup uses the next shorter suffix. At byte s, s+4, s+8, ... it
 // writes the distribution of the following byte. A single-layer transformer
 // with context 1000 reads those distributions and is trained to name the byte
 // each distribution was aimed at. Counts are fit on the first 90% of the file.
@@ -55,11 +56,13 @@ func main() {
 	trainEnd := int(float64(len(data)) * trainFraction)
 	fmt.Printf("corpus pg100.txt bytes=%d train=%d test=%d\n", len(data), trainEnd, len(data)-trainEnd)
 
-	fmt.Println("fitting order-4 markov counts...")
+	fmt.Println("fitting markov counts for orders 4, 3, 2, and 1...")
 	markov := newMarkov()
 	t0 := time.Now()
 	markov.Train(data, trainEnd)
-	fmt.Printf("markov contexts=%d observations=%d fit=%s\n", len(markov.tab), markov.observations, time.Since(t0).Round(time.Millisecond))
+	n4, n3, n2, n1 := markov.Orders()
+	fmt.Printf("markov contexts 4=%d 3=%d 2=%d 1=%d observations=%d fit=%s\n",
+		n4, n3, n2, n1, markov.observations, time.Since(t0).Round(time.Millisecond))
 
 	trainLOO := markov.Evaluate(data, order, trainEnd, 1, true)
 	testAll := markov.Evaluate(data, trainEnd, len(data), 1, false)
