@@ -248,7 +248,9 @@ func attnBackward(q, k, v, attn, dctx []float32, T, H, Dh int, scale float32, dq
 // Gradients are the derivative of the mean next-byte cross-entropy and overwrite g.
 func forwardBackward(cfg Config, w, g *tensors, ws *workspace, x []float32, targets []byte) (loss float64, correct int) {
 	T := len(targets)
-	if T != ws.T || len(x) != T*ws.V {
+	// A workspace allocated for a longer window can run a shorter one.
+	// Positions still start at 0, matching training on a prefix of that length.
+	if T < 1 || T > ws.T || len(x) != T*ws.V {
 		panic("batch shape")
 	}
 	if g != nil {

@@ -206,6 +206,22 @@ func (m *Markov) Evaluate(data []byte, lo, hi, step int, loo bool) score {
 	return out
 }
 
+// PredictWindow writes T Markov distributions aligned to predict the byte at
+// index n. data[:n] is the prefix; the target byte itself is not read.
+// The last row is P(· | data[n-4:n]).
+func (m *Markov) PredictWindow(data []byte, n, T int, x []float32) {
+	if T < 1 || n < order*T || len(data) < n || len(x) < T*vocab {
+		panic("predict window")
+	}
+	start := n - order*T
+	var ctx markovKey
+	for j := 0; j < T; j++ {
+		off := start + order*j
+		copy(ctx[:], data[off:off+order])
+		m.Dist(ctx, 0, false, x[j*vocab:(j+1)*vocab])
+	}
+}
+
 // Fill writes a transformer window opened at byte offset s.
 // Position j gets P(· | data[s+4j : s+4j+4]) and target data[s+4j+4].
 func (m *Markov) Fill(data []byte, s, T int, loo bool, x []float32, targets []byte) {

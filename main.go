@@ -10,6 +10,9 @@
 // each distribution was aimed at. Counts are fit on the first 90% of the file.
 // Training inputs use leave-one-out counts so a target is not packed into its
 // own distribution. Both models are scored on the held-out suffix.
+//
+// With -prompt, Monte Carlo tree search builds a continuation that maximizes
+// the transformer's probability of that string.
 package main
 
 import (
@@ -32,7 +35,15 @@ func main() {
 	lr := flag.Float64("lr", 1e-3, "Adam learning rate")
 	seed := flag.Int64("seed", 1, "rng seed")
 	evalN := flag.Int("eval", 16, "held-out windows used to score the transformer")
+	prompt := flag.String("prompt", "", "generate a continuation of this text")
+	genN := flag.Int("gen", 32, "bytes to generate from -prompt")
+	sims := flag.Int("sims", 64, "MCTS simulations")
+	topk := flag.Int("topk", 16, "MCTS actions kept from each next-byte distribution")
 	flag.Parse()
+	if *prompt != "" && len(*prompt) < order {
+		fmt.Println("prompt must be at least 4 bytes")
+		os.Exit(1)
+	}
 
 	data, err := os.ReadFile("pg100.txt")
 	if err != nil {
@@ -102,6 +113,17 @@ func main() {
 	fmt.Printf("train last-batch loss=%.4f  held-out ce %.4f -> %.4f (delta %.4f nats)\n",
 		lastLoss, before.ce(), after.ce(), before.ce()-after.ce())
 	printSample(weights, cfg, markov, data, testStarts[0])
+
+	if *prompt != "" {
+		fmt.Printf("mcts prompt=%s gen=%d sims=%d topk=%d\n", strconv.Quote(*prompt), *genN, *sims, *topk)
+		tGen := time.Now()
+		out := newGenerator(cfg, weights, markov).Search([]byte(*prompt), *genN, *sims, *topk, rng)
+		fmt.Printf("greedy logp=%.3f (%.3f bits/byte) %s\n",
+			out.greedyLogp, -out.greedyLogp/math.Ln2/float64(*genN), strconv.Quote(string(out.greedy)))
+		fmt.Printf("mcts   logp=%.3f (%.3f bits/byte) %s\n",
+			out.logp, -out.logp/math.Ln2/float64(*genN), strconv.Quote(string(out.text)))
+		fmt.Printf("generated in %s\n", time.Since(tGen).Round(time.Millisecond))
+	}
 
 	if testAll.acc() < 0.4 || testAll.ce() > 2.5 {
 		fmt.Println("verification failed: markov held-out fit is below the sanity bar")
