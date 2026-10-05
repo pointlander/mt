@@ -10,13 +10,24 @@ import (
 	"sort"
 )
 
-// A continuation's string probability is the transformer's autoregressive
-// probability. Each factor is the next-byte distribution at that prefix.
-// The inputs to that distribution are the order-4 Markov rows aligned to the
-// byte being predicted. Monte Carlo tree search maximizes the sum of the
-// log factors over a fixed number of new bytes.
+// A continuation's string probability is the product of the decoding
+// distribution at each new byte. That distribution is the transformer's
+// next-byte softmax, with a penalty on a byte that would extend a cycle
+// already sitting at the end of the prefix. The inputs to the transformer
+// are the order-4 Markov rows aligned to the byte being predicted. Monte
+// Carlo tree search maximizes the sum of the log factors over a fixed
+// number of new bytes.
 
 const mctsCPuct = 1.5
+
+// repMaxPeriod is the longest immediate cycle the decoder discourages.
+// A one-byte run may be three long ("www"); the fourth copy is removed.
+// A cycle of 2..repMaxPeriod bytes is down-weighted once it has already
+// occurred twice, and removed once it has occurred three times.
+const (
+	repMaxPeriod = 8
+	repSoft      = float32(0.2)
+)
 
 type bytePrior struct {
 	b byte
@@ -274,7 +285,10 @@ func newGenerator(cfg Config, w *tensors, m *Markov) *generator {
 	}
 }
 
-// Next is the transformer distribution for the byte that would follow prefix.
+// Next is the decoding distribution for the byte that would follow prefix.
+// The cache stores the raw softmax, keyed by the model's context. The
+// repetition penalty depends on the whole prefix, so it is applied on the
+// way out and is not cached.
 func (g *generator) Next(prefix []byte) []float32 {
 	if len(prefix) < order {
 		panic("prompt shorter than 4 bytes")
@@ -284,14 +298,101 @@ func (g *generator) Next(prefix []byte) []float32 {
 		T = g.cfg.Context
 	}
 	key := string(prefix[len(prefix)-T*order:])
-	if d, ok := g.cache[key]; ok {
-		return d
+	raw, ok := g.cache[key]
+	if !ok {
+		g.m.PredictWindow(prefix, len(prefix), T, g.x[:T*vocab])
+		forwardBackward(g.cfg, g.w, nil, g.ws, g.x[:T*vocab], g.targets[:T])
+		raw = softmax(g.ws.logits[(T-1)*vocab : T*vocab])
+		g.cache[key] = raw
 	}
-	g.m.PredictWindow(prefix, len(prefix), T, g.x[:T*vocab])
-	forwardBackward(g.cfg, g.w, nil, g.ws, g.x[:T*vocab], g.targets[:T])
-	probs := softmax(g.ws.logits[(T-1)*vocab : T*vocab])
-	g.cache[key] = probs
-	return probs
+	return diversify(raw, prefix)
+}
+
+// repetitionCycles is how many extra copies of the last p bytes sit
+// immediately before that block. "aaa" with p=1 returns 2.
+func repetitionCycles(prefix []byte, p int) int {
+	n := len(prefix)
+	if p < 1 || n < 2*p {
+		return 0
+	}
+	cycles := 0
+	for n >= (cycles+2)*p {
+		a := n - (cycles+1)*p
+		b := a - p
+		match := true
+		for i := 0; i < p; i++ {
+			if prefix[a+i] != prefix[b+i] {
+				match = false
+				break
+			}
+		}
+		if !match {
+			break
+		}
+		cycles++
+	}
+	return cycles
+}
+
+// diversify returns a copy of raw with repeated cycles discouraged.
+// A hard-zeroed byte stays zero after renormalization. If that leaves no
+// mass, the remaining bytes share a uniform distribution.
+func diversify(raw []float32, prefix []byte) []float32 {
+	out := append([]float32(nil), raw...)
+	blocked := make([]bool, len(out))
+	if repetitionCycles(prefix, 1) >= 2 {
+		b := prefix[len(prefix)-1]
+		out[b] = 0
+		blocked[b] = true
+	}
+	for p := 2; p <= repMaxPeriod && p <= len(prefix); p++ {
+		cycles := repetitionCycles(prefix, p)
+		if cycles < 1 {
+			continue
+		}
+		b := prefix[len(prefix)-p]
+		if cycles >= 2 {
+			out[b] = 0
+			blocked[b] = true
+			continue
+		}
+		if !blocked[b] {
+			out[b] *= repSoft
+		}
+	}
+	var sum float64
+	open := 0
+	for i, v := range out {
+		if blocked[i] {
+			out[i] = 0
+			continue
+		}
+		sum += float64(v)
+		open++
+	}
+	if open == 0 {
+		u := float32(1) / float32(len(out))
+		for i := range out {
+			out[i] = u
+		}
+		return out
+	}
+	if sum == 0 {
+		u := float32(1) / float32(open)
+		for i := range out {
+			if !blocked[i] {
+				out[i] = u
+			}
+		}
+		return out
+	}
+	inv := float32(1 / sum)
+	for i := range out {
+		if !blocked[i] {
+			out[i] *= inv
+		}
+	}
+	return out
 }
 
 func (g *generator) Search(prompt []byte, length, sims, topk int, rng *rand.Rand) continuation {

@@ -117,6 +117,106 @@ func TestGenerateOnModel(t *testing.T) {
 	}
 }
 
+func TestDiversifyBreaksRuns(t *testing.T) {
+	raw := make([]float32, vocab)
+	raw['a'] = 1
+
+	// Three identical bytes already: the fourth copy is removed, and a
+	// delta on that byte must not renorm back to 1.
+	got := diversify(raw, []byte("aaa"))
+	if got['a'] != 0 {
+		t.Fatalf("run of three left 'a' at %g", got['a'])
+	}
+	u := float32(1) / float32(vocab-1)
+	var sum float64
+	for i, v := range got {
+		sum += float64(v)
+		if i == int('a') {
+			continue
+		}
+		if v != u {
+			t.Fatalf("byte %d = %g want %g", i, v, u)
+		}
+	}
+	if math.Abs(sum-1) > 1e-5 {
+		t.Fatalf("sum %g", sum)
+	}
+
+	// Two copies are still free, so "www" and a double letter can finish.
+	still := diversify(raw, []byte("aa"))
+	if still['a'] < 0.99 {
+		t.Fatalf("run of two was blocked: %g", still['a'])
+	}
+}
+
+func TestDiversifyPeriod(t *testing.T) {
+	raw := make([]float32, vocab)
+	raw['r'] = 0.5
+	raw['z'] = 0.5
+
+	// "rere" is the pattern twice: discourage another 'r', but keep it.
+	soft := diversify(raw, []byte("rere"))
+	if soft['r'] == 0 || !(soft['r'] < soft['z']) {
+		t.Fatalf("soft r=%g z=%g", soft['r'], soft['z'])
+	}
+	var sum float64
+	for _, v := range soft {
+		sum += float64(v)
+	}
+	if math.Abs(sum-1) > 1e-5 {
+		t.Fatalf("soft sum %g", sum)
+	}
+
+	// "rerere" is the pattern three times: the next copy is impossible.
+	hard := diversify(raw, []byte("rerere"))
+	if hard['r'] != 0 {
+		t.Fatalf("rerere left r=%g", hard['r'])
+	}
+	if hard['z'] <= hard['r'] {
+		t.Fatalf("hard z=%g r=%g", hard['z'], hard['r'])
+	}
+
+	// "banan" has one "an" repeat. A confident model may still finish "banana".
+	word := make([]float32, vocab)
+	word['a'] = 0.9
+	word['z'] = 0.1
+	done := diversify(word, []byte("banan"))
+	if done['a'] == 0 || !(done['a'] > done['z']) {
+		t.Fatalf("banana completion a=%g z=%g", done['a'], done['z'])
+	}
+}
+
+func TestSearchBreaksRepeat(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	raw := make([]float32, vocab)
+	raw['z'] = 1
+	next := func(prefix []byte) []float32 {
+		return diversify(raw, prefix)
+	}
+	got := searchContinuation([]byte("zzz"), 8, 4, 4, rng, next)
+	if string(got.greedy) == "zzzzzzzz" || string(got.text) == "zzzzzzzz" {
+		t.Fatalf("run survived greedy %q mcts %q", got.greedy, got.text)
+	}
+	if maxRun(append([]byte("zzz"), got.greedy...)) >= 4 || maxRun(append([]byte("zzz"), got.text...)) >= 4 {
+		t.Fatalf("run of 4 greedy %q mcts %q", got.greedy, got.text)
+	}
+}
+
+func maxRun(s []byte) int {
+	best, cur := 1, 1
+	for i := 1; i < len(s); i++ {
+		if s[i] == s[i-1] {
+			cur++
+			if cur > best {
+				best = cur
+			}
+			continue
+		}
+		cur = 1
+	}
+	return best
+}
+
 func continuationLogp(prompt, text []byte, next func([]byte) []float32) float64 {
 	cur := append([]byte(nil), prompt...)
 	var logp float64

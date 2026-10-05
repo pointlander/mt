@@ -13,7 +13,8 @@
 // own distribution. Both models are scored on the held-out suffix.
 //
 // With -prompt, Monte Carlo tree search builds a continuation that maximizes
-// the transformer's probability of that string.
+// the decoding probability of that string. A repeated cycle is penalized in
+// that distribution so the search does not lock onto a loop.
 package main
 
 import (
