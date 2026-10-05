@@ -10,61 +10,72 @@ import (
 	"testing"
 )
 
-// trap is a next-byte model whose greedy decode is not the maximum-probability
-// string. From the empty prefix, 'a' is more likely than 'b'. After 'a' every
-// byte is uniform. After 'b' the next byte is 'y' with probability 1.
-func trap(prefix []byte) []float32 {
+func xz(prefix []byte) []float32 {
 	p := make([]float32, vocab)
-	switch {
-	case len(prefix) == 0:
-		p['a'] = 0.6
-		p['b'] = 0.4
-	case prefix[len(prefix)-1] == 'b':
-		p['y'] = 1
-	default:
-		u := float32(1) / vocab
-		for i := range p {
-			p[i] = u
-		}
-	}
+	p['x'] = 0.7
+	p['z'] = 0.3
 	return p
 }
 
-func TestMCTSBeatsGreedy(t *testing.T) {
+func TestDeltaSample(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
-	got := searchContinuation(nil, 2, 8, 2, rng, trap)
-	if string(got.greedy) != "a\x00" {
-		t.Fatalf("greedy %q", got.greedy)
+	next := func(prefix []byte) []float32 {
+		p := make([]float32, vocab)
+		p['x'] = 1
+		return p
 	}
-	if string(got.text) != "by" {
-		t.Fatalf("mcts %q logp=%g greedyLogp=%g", got.text, got.logp, got.greedyLogp)
+	got := searchContinuation([]byte("hi"), 3, 4, rng, next)
+	if string(got.sample) != "xxx" || string(got.text) != "xxx" {
+		t.Fatalf("sample %q mcts %q", got.sample, got.text)
 	}
-	// Priors are stored as float32, so the log uses that rounding.
-	want := math.Log(float64(float32(0.4))) + math.Log(1)
-	if math.Abs(got.logp-want) > 1e-9 {
-		t.Fatalf("logp %g want %g", got.logp, want)
-	}
-	if !(got.logp > got.greedyLogp) {
-		t.Fatalf("mcts did not beat greedy: %g vs %g", got.logp, got.greedyLogp)
+	if got.sampleLogp != 0 || got.logp != 0 {
+		t.Fatalf("logp sample %g mcts %g", got.sampleLogp, got.logp)
 	}
 }
 
-func TestContinuationLogp(t *testing.T) {
+func TestZeroSimsSharesSample(t *testing.T) {
 	rng := rand.New(rand.NewSource(2))
 	prompt := []byte("hi")
-	next := func(prefix []byte) []float32 {
-		p := make([]float32, vocab)
-		p['x'] = 0.7
-		p['z'] = 0.3
-		return p
+	got := searchContinuation(prompt, 5, 0, rng, xz)
+	if string(got.sample) != string(got.text) || got.sampleLogp != got.logp {
+		t.Fatalf("sample %q (%g) mcts %q (%g)", got.sample, got.sampleLogp, got.text, got.logp)
 	}
-	got := searchContinuation(prompt, 3, 0, 2, rng, next)
-	if string(got.text) != "xxx" || string(got.greedy) != "xxx" {
-		t.Fatalf("got %q greedy %q", got.text, got.greedy)
+	if math.Abs(continuationLogp(prompt, got.text, xz)-got.logp) > 1e-9 {
+		t.Fatalf("logp %g", got.logp)
 	}
-	want := 3 * math.Log(float64(float32(0.7)))
-	if math.Abs(got.logp-want) > 1e-9 {
-		t.Fatalf("logp %g want %g", got.logp, want)
+}
+
+func TestSamplesFromSoftmax(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	prompt := []byte("hi")
+	var nx, n int
+	for i := 0; i < 20; i++ {
+		got := searchContinuation(prompt, 8, 1, rng, xz)
+		for _, part := range [][]byte{got.sample, got.text} {
+			if len(part) != 8 {
+				t.Fatalf("length %d", len(part))
+			}
+			for _, b := range part {
+				n++
+				switch b {
+				case 'x':
+					nx++
+				case 'z':
+				default:
+					t.Fatalf("unexpected byte %q", []byte{b})
+				}
+			}
+		}
+		if math.Abs(continuationLogp(prompt, got.sample, xz)-got.sampleLogp) > 1e-9 {
+			t.Fatalf("sample logp %g", got.sampleLogp)
+		}
+		if math.Abs(continuationLogp(prompt, got.text, xz)-got.logp) > 1e-9 {
+			t.Fatalf("mcts logp %g", got.logp)
+		}
+	}
+	frac := float64(nx) / float64(n)
+	if frac > 0.9 || frac < 0.5 {
+		t.Fatalf("fraction of x = %g (n=%d), sampling collapsed toward argmax or away from it", frac, n)
 	}
 }
 
@@ -99,21 +110,93 @@ func TestGenerateOnModel(t *testing.T) {
 	rng := rand.New(rand.NewSource(4))
 	w := newTensors(cfg)
 	initTensors(w, cfg, rng)
-	g := newGenerator(cfg, w, m)
+	g := newGenerator(cfg, w, m, 1)
 	prompt := []byte("abcd")
-	got := g.Search(prompt, 4, 4, 4, rng)
-	if len(got.text) != 4 || len(got.greedy) != 4 {
-		t.Fatalf("lengths %d %d", len(got.text), len(got.greedy))
+	got := g.Search(prompt, 4, 4, rng)
+	if len(got.text) != 4 || len(got.sample) != 4 {
+		t.Fatalf("lengths %d %d", len(got.text), len(got.sample))
 	}
-	if math.IsNaN(got.logp) || math.IsInf(got.logp, 0) {
-		t.Fatalf("logp %g", got.logp)
+	if math.IsNaN(got.logp) || math.IsInf(got.logp, 0) || math.IsNaN(got.sampleLogp) || math.IsInf(got.sampleLogp, 0) {
+		t.Fatalf("logp sample %g mcts %g", got.sampleLogp, got.logp)
 	}
-	if got.logp+1e-6 < got.greedyLogp {
-		t.Fatalf("search %g lost to greedy %g", got.logp, got.greedyLogp)
+	if math.Abs(continuationLogp(prompt, got.text, g.Next)-got.logp) > 1e-6 {
+		t.Fatalf("recomputed mcts %g != %g", continuationLogp(prompt, got.text, g.Next), got.logp)
 	}
-	again := continuationLogp(prompt, got.text, g.Next)
-	if math.Abs(again-got.logp) > 1e-6 {
-		t.Fatalf("recomputed %g != %g", again, got.logp)
+	if math.Abs(continuationLogp(prompt, got.sample, g.Next)-got.sampleLogp) > 1e-6 {
+		t.Fatalf("recomputed sample %g != %g", continuationLogp(prompt, got.sample, g.Next), got.sampleLogp)
+	}
+}
+
+func TestSoftmaxTemperature(t *testing.T) {
+	logits := []float32{0, 1, 3}
+	unit := softmax(logits, 1)
+	var wantSum float64
+	wants := make([]float64, len(logits))
+	for i, v := range logits {
+		wants[i] = math.Exp(float64(v - logits[2]))
+		wantSum += wants[i]
+	}
+	var sum float64
+	for i := range wants {
+		wants[i] /= wantSum
+		sum += float64(unit[i])
+		if math.Abs(float64(unit[i])-wants[i]) > 1e-6 {
+			t.Fatalf("T=1 [%d] %g want %g", i, unit[i], wants[i])
+		}
+	}
+	if math.Abs(sum-1) > 1e-5 {
+		t.Fatalf("sum %g", sum)
+	}
+	hot := softmax(logits, 0.5)
+	cold := softmax(logits, 2)
+	if !(hot[2] > unit[2] && unit[2] > cold[2]) {
+		t.Fatalf("peak hot=%g unit=%g cold=%g", hot[2], unit[2], cold[2])
+	}
+	if !(cold[0] > unit[0] && unit[0] > hot[0]) {
+		t.Fatalf("tail cold=%g unit=%g hot=%g", cold[0], unit[0], hot[0])
+	}
+	for _, dist := range [][]float32{hot, cold} {
+		sum = 0
+		for _, v := range dist {
+			sum += float64(v)
+			if v <= 0 {
+				t.Fatalf("nonpositive %g", v)
+			}
+		}
+		if math.Abs(sum-1) > 1e-5 {
+			t.Fatalf("sum %g", sum)
+		}
+	}
+}
+
+func TestGeneratorTemperatureFlattens(t *testing.T) {
+	data := []byte("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz")
+	m := newMarkov()
+	m.Train(data, len(data))
+	cfg := Config{Vocab: vocab, Context: 8, D: 16, Heads: 2, DFF: 32}
+	rng := rand.New(rand.NewSource(5))
+	w := newTensors(cfg)
+	initTensors(w, cfg, rng)
+	prefix := []byte("abcd")
+	cold := newGenerator(cfg, w, m, 2).Next(prefix)
+	hot := newGenerator(cfg, w, m, 0.5).Next(prefix)
+	coldMax, hotMax := cold[0], hot[0]
+	var coldSum, hotSum float64
+	for i := range cold {
+		coldSum += float64(cold[i])
+		hotSum += float64(hot[i])
+		if cold[i] > coldMax {
+			coldMax = cold[i]
+		}
+		if hot[i] > hotMax {
+			hotMax = hot[i]
+		}
+	}
+	if !(hotMax > coldMax) {
+		t.Fatalf("lower temperature was not sharper: hot %g cold %g", hotMax, coldMax)
+	}
+	if math.Abs(coldSum-1) > 1e-4 || math.Abs(hotSum-1) > 1e-4 {
+		t.Fatalf("sums %g %g", coldSum, hotSum)
 	}
 }
 

@@ -12,8 +12,9 @@
 // Training inputs use leave-one-out counts so a target is not packed into its
 // own distribution. Both models are scored on the held-out suffix.
 //
-// With -prompt, Monte Carlo tree search builds a continuation that maximizes
-// the transformer's probability of that string.
+// With -prompt, the sample line and the MCTS line are both random draws from
+// the tempered softmax. -temp scales that softmax. The MCTS line is the last
+// of -sims draws.
 package main
 
 import (
@@ -38,11 +39,15 @@ func main() {
 	evalN := flag.Int("eval", 16, "held-out windows used to score the transformer")
 	prompt := flag.String("prompt", "", "generate a continuation of this text")
 	genN := flag.Int("gen", 32, "bytes to generate from -prompt")
-	sims := flag.Int("sims", 64, "MCTS simulations")
-	topk := flag.Int("topk", 16, "MCTS actions kept from each next-byte distribution")
+	sims := flag.Int("sims", 1, "softmax samples for the MCTS line; the last one is printed")
+	temp := flag.Float64("temp", 1, "softmax temperature for generation")
 	flag.Parse()
 	if *prompt != "" && len(*prompt) < order {
 		fmt.Println("prompt must be at least 4 bytes")
+		os.Exit(1)
+	}
+	if !(*temp > 0) {
+		fmt.Println("temperature must be positive")
 		os.Exit(1)
 	}
 
@@ -118,11 +123,11 @@ func main() {
 	printSample(weights, cfg, markov, data, testStarts[0])
 
 	if *prompt != "" {
-		fmt.Printf("mcts prompt=%s gen=%d sims=%d topk=%d\n", strconv.Quote(*prompt), *genN, *sims, *topk)
+		fmt.Printf("sample prompt=%s gen=%d sims=%d temp=%g\n", strconv.Quote(*prompt), *genN, *sims, *temp)
 		tGen := time.Now()
-		out := newGenerator(cfg, weights, markov).Search([]byte(*prompt), *genN, *sims, *topk, rng)
-		fmt.Printf("greedy logp=%.3f (%.3f bits/byte) %s\n",
-			out.greedyLogp, -out.greedyLogp/math.Ln2/float64(*genN), strconv.Quote(string(out.greedy)))
+		out := newGenerator(cfg, weights, markov, *temp).Search([]byte(*prompt), *genN, *sims, rng)
+		fmt.Printf("sample logp=%.3f (%.3f bits/byte) %s\n",
+			out.sampleLogp, -out.sampleLogp/math.Ln2/float64(*genN), strconv.Quote(string(out.sample)))
 		fmt.Printf("mcts   logp=%.3f (%.3f bits/byte) %s\n",
 			out.logp, -out.logp/math.Ln2/float64(*genN), strconv.Quote(string(out.text)))
 		fmt.Printf("generated in %s\n", time.Since(tGen).Round(time.Millisecond))
