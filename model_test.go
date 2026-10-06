@@ -385,6 +385,127 @@ func TestOverfit(t *testing.T) {
 	}
 }
 
+func TestDefaultContext(t *testing.T) {
+	cfg := defaultConfig()
+	if cfg.Context != 1000 || cfg.Compressed != 1000 || cfg.Group != 1000 || cfg.seqLen() != 2000 {
+		t.Fatalf("context=%d compressed=%d group=%d seq=%d", cfg.Context, cfg.Compressed, cfg.Group, cfg.seqLen())
+	}
+}
+
+func TestLossSkipsPrefix(t *testing.T) {
+	logits := []float32{
+		0, 10,
+		10, 0,
+		0, 10,
+	}
+	// The skipped row predicts the wrong byte. The two scored rows are correct.
+	targets := []byte{0, 0, 1}
+	d := make([]float32, len(logits))
+	for i := range d {
+		d[i] = 7
+	}
+	loss, correct := softmaxCE(logits, targets, 3, 2, 1, d)
+	if correct != 2 {
+		t.Fatalf("correct %d", correct)
+	}
+	if d[0] != 0 || d[1] != 0 {
+		t.Fatalf("prefix grad %v", d[:2])
+	}
+	lossAll, correctAll := softmaxCE(logits, targets, 3, 2, 0, d)
+	if correctAll != 2 || !(lossAll > loss+1) {
+		t.Fatalf("full correct %d loss %g vs scored %g", correctAll, lossAll, loss)
+	}
+}
+
+func TestCompressedWindow(t *testing.T) {
+	const raw, compressed, group = 2, 2, 3
+	// Vectors 0..7 need bytes through offset 7*4+4.
+	var data []byte
+	for i := 0; i < 8; i++ {
+		data = append(data, []byte("abcdefghij")...)
+	}
+	m := newMarkov()
+	m.Train(data, len(data))
+	pre := m.buildDistPrefix(data)
+	s := 6 * stride
+	span := compressed + raw
+	x := make([]float32, span*vocab)
+	targets := make([]byte, raw)
+	m.WriteWindow(data, s, raw, compressed, group, true, pre, x, targets)
+	direct := make([]float32, len(x))
+	m.WriteWindow(data, s, raw, compressed, group, true, nil, direct, targets)
+	for i := range x {
+		if math.Abs(float64(x[i]-direct[i])) > 1e-5 {
+			t.Fatalf("prefix path %d %g != direct %g", i, x[i], direct[i])
+		}
+	}
+	var ctx markovKey
+	var row [vocab]float32
+	// Bucket 0 sums raw rows 0,1,2. Bucket 1 sums rows 3,4,5. Current rows are 6 and 7.
+	for bkt := 0; bkt < compressed; bkt++ {
+		var want [vocab]float32
+		for g := 0; g < group; g++ {
+			off := (bkt*group + g) * stride
+			copy(ctx[:], data[off:off+order])
+			m.Dist(ctx, 0, false, row[:])
+			for i := range want {
+				want[i] += row[i]
+			}
+		}
+		got := direct[bkt*vocab : (bkt+1)*vocab]
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("bucket %d byte %d %g != %g", bkt, i, got[i], want[i])
+			}
+		}
+	}
+	for j := 0; j < raw; j++ {
+		off := s + stride*j
+		if targets[j] != data[off+order] {
+			t.Fatalf("target %d %q", j, targets[j])
+		}
+		copy(ctx[:], data[off:off+order])
+		m.Dist(ctx, targets[j], true, row[:])
+		got := x[(compressed+j)*vocab : (compressed+j+1)*vocab]
+		for i := range row {
+			if got[i] != row[i] {
+				t.Fatalf("raw row %d byte %d %g != %g", j, i, got[i], row[i])
+			}
+		}
+	}
+	// The window at the start of the file has no history, so both buckets are zero.
+	early := make([]float32, span*vocab)
+	m.WriteWindow(data, 0, raw, compressed, group, false, pre, early, targets)
+	for i := 0; i < compressed*vocab; i++ {
+		if early[i] != 0 {
+			t.Fatalf("early compressed %d = %g", i, early[i])
+		}
+	}
+	// One raw row of history fills only the newest bucket.
+	partial := make([]float32, span*vocab)
+	m.WriteWindow(data, stride, raw, compressed, group, false, nil, partial, targets)
+	for i := 0; i < vocab; i++ {
+		if partial[i] != 0 {
+			t.Fatalf("older bucket %d = %g", i, partial[i])
+		}
+	}
+	var sum float32
+	for _, v := range partial[vocab : 2*vocab] {
+		sum += v
+	}
+	// One probability row sums to 1.
+	if math.Abs(float64(sum)-1) > 1e-4 {
+		t.Fatalf("partial bucket sum %g", sum)
+	}
+	partialPre := make([]float32, span*vocab)
+	m.WriteWindow(data, stride, raw, compressed, group, false, pre, partialPre, targets)
+	for i := range partial {
+		if math.Abs(float64(partialPre[i]-partial[i])) > 1e-5 {
+			t.Fatalf("partial prefix %d %g != direct %g", i, partialPre[i], partial[i])
+		}
+	}
+}
+
 func TestMarkovPG100(t *testing.T) {
 	data, err := os.ReadFile("pg100.txt")
 	if err != nil {

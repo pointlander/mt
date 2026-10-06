@@ -10,17 +10,35 @@ import (
 )
 
 // Config is a single-layer causal transformer.
-// Each position consumes a vocab-sized probability vector and predicts the next byte.
+// Each position consumes a vocab-sized vector. Context is the number of raw
+// probability rows that are scored. Compressed rows are prepended; each is
+// the sum of Group earlier raw rows, so the sequence is Compressed+Context long.
 type Config struct {
-	Vocab   int
-	Context int
-	D       int
-	Heads   int
-	DFF     int
+	Vocab      int
+	Context    int
+	Compressed int
+	Group      int
+	D          int
+	Heads      int
+	DFF        int
 }
 
 func defaultConfig() Config {
-	return Config{Vocab: vocab, Context: 1000, D: 64, Heads: 4, DFF: 256}
+	return Config{
+		Vocab: vocab, Context: 1000, Compressed: 1000, Group: 1000,
+		D: 64, Heads: 4, DFF: 256,
+	}
+}
+
+// seqLen is the transformer length: compressed sums, then the raw rows.
+func (c Config) seqLen() int {
+	if c.Context < 1 {
+		panic("context")
+	}
+	if c.Compressed < 0 || (c.Compressed > 0 && c.Group < 1) {
+		panic("compressed context")
+	}
+	return c.Compressed + c.Context
 }
 
 type tensors struct {
@@ -60,7 +78,7 @@ func newTensors(cfg Config) *tensors {
 		panic("model dimension must be divisible by the head count")
 	}
 	a := func(n int) []float32 { return make([]float32, n) }
-	d, v, ctx, dff := cfg.D, cfg.Vocab, cfg.Context, cfg.DFF
+	d, v, ctx, dff := cfg.D, cfg.Vocab, cfg.seqLen(), cfg.DFF
 	return &tensors{
 		InW: a(v * d), InB: a(d),
 		Pos:  a(ctx * d),
@@ -130,7 +148,7 @@ type workspace struct {
 }
 
 func newWorkspace(cfg Config, T int) *workspace {
-	if T < 1 || T > cfg.Context {
+	if T < 1 || T > cfg.seqLen() {
 		panic("workspace length")
 	}
 	d, h, dff, v := cfg.D, cfg.Heads, cfg.DFF, cfg.Vocab
@@ -233,14 +251,18 @@ func attnBackward(q, k, v, attn, dctx []float32, T, H, Dh int, scale float32, dq
 	}
 }
 
-// forwardBackward runs one causal window. x holds T probability rows of width V.
-// Gradients are the derivative of the mean next-byte cross-entropy and overwrite g.
+// forwardBackward runs one causal window. x holds T rows of width V.
+// Compressed rows sit at the front and are left out of the loss. Gradients
+// are the derivative of the mean cross-entropy on the remaining rows and overwrite g.
+// A workspace allocated for a longer window can run a shorter one.
+// Positions still start at 0, matching training on a prefix of that length.
 func forwardBackward(cfg Config, w, g *tensors, ws *workspace, x []float32, targets []byte) (loss float64, correct int) {
 	T := len(targets)
-	// A workspace allocated for a longer window can run a shorter one.
-	// Positions still start at 0, matching training on a prefix of that length.
 	if T < 1 || T > ws.T || len(x) != T*ws.V {
 		panic("batch shape")
+	}
+	if cfg.Compressed > T-1 {
+		panic("loss range")
 	}
 	if g != nil {
 		g.zero()
@@ -279,7 +301,7 @@ func forwardBackward(cfg Config, w, g *tensors, ws *workspace, x []float32, targ
 	mul(ws.lnf, T, D, w.Wh, V, ws.logits)
 	addBias(ws.logits, T, V, w.Bh)
 
-	loss, correct = softmaxCE(ws.logits, targets, T, V, ws.glogits)
+	loss, correct = softmaxCE(ws.logits, targets, T, V, cfg.Compressed, ws.glogits)
 	if g == nil {
 		return loss, correct
 	}
@@ -336,9 +358,14 @@ func forwardBackward(cfg Config, w, g *tensors, ws *workspace, x []float32, targ
 	return loss, correct
 }
 
-func softmaxCE(logits []float32, targets []byte, T, V int, dlogits []float32) (loss float64, correct int) {
-	invT := 1 / float32(T)
-	for t := 0; t < T; t++ {
+func softmaxCE(logits []float32, targets []byte, T, V, lossStart int, dlogits []float32) (loss float64, correct int) {
+	if lossStart < 0 || lossStart >= T {
+		panic("loss range")
+	}
+	n := T - lossStart
+	invN := 1 / float32(n)
+	clear(dlogits[:lossStart*V])
+	for t := lossStart; t < T; t++ {
 		row := logits[t*V : t*V+V]
 		drow := dlogits[t*V : t*V+V]
 		max := row[0]
@@ -374,10 +401,10 @@ func softmaxCE(logits []float32, targets []byte, T, V int, dlogits []float32) (l
 			if i == tgt {
 				g -= 1
 			}
-			drow[i] = g * invT
+			drow[i] = g * invN
 		}
 	}
-	loss /= float64(T)
+	loss /= float64(n)
 	return loss, correct
 }
 

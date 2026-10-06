@@ -108,28 +108,42 @@ func newGenerator(cfg Config, w *tensors, m *Markov, temperature float64) *gener
 		cfg:         cfg,
 		w:           w,
 		m:           m,
-		ws:          newWorkspace(cfg, cfg.Context),
-		x:           make([]float32, cfg.Context*cfg.Vocab),
-		targets:     make([]byte, cfg.Context),
+		ws:          newWorkspace(cfg, cfg.seqLen()),
+		x:           make([]float32, cfg.seqLen()*cfg.Vocab),
+		targets:     make([]byte, cfg.seqLen()),
 		cache:       make(map[string][]float32),
 		temperature: temperature,
 	}
 }
 
 // Next is the tempered transformer distribution for the byte after prefix.
+// Compressed sums of earlier rows are prepended when the model has them.
+// The cache key is the suffix of prefix that those rows actually read.
 func (g *generator) Next(prefix []byte) []float32 {
 	if len(prefix) < order {
 		panic("prompt shorter than 4 bytes")
 	}
-	T := len(prefix) / order
-	if T > g.cfg.Context {
-		T = g.cfg.Context
+	nvec := len(prefix) / order
+	raw := nvec
+	if raw > g.cfg.Context {
+		raw = g.cfg.Context
 	}
-	key := string(prefix[len(prefix)-T*order:])
+	compressed := g.cfg.Compressed
+	hist := 0
+	if compressed > 0 {
+		hist = compressed * g.cfg.Group
+		if hist > nvec-raw {
+			hist = nvec - raw
+		}
+	}
+	used := (hist + raw) * order
+	key := string(prefix[len(prefix)-used:])
 	if d, ok := g.cache[key]; ok {
 		return d
 	}
-	g.m.PredictWindow(prefix, len(prefix), T, g.x[:T*vocab])
+	T := compressed + raw
+	s := len(prefix) - raw*order
+	g.m.WriteWindow(prefix, s, raw, compressed, g.cfg.Group, false, nil, g.x[:T*vocab], g.targets[compressed:T])
 	forwardBackward(g.cfg, g.w, nil, g.ws, g.x[:T*vocab], g.targets[:T])
 	probs := softmax(g.ws.logits[(T-1)*vocab:T*vocab], g.temperature)
 	g.cache[key] = probs

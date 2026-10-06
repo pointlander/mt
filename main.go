@@ -7,9 +7,11 @@
 // The Markov model counts next-byte contexts of 4, 3, 2, and 1 bytes, and a
 // missed lookup uses the next shorter suffix. At byte s, s+4, s+8, ... it
 // writes the distribution of the following byte. A single-layer transformer
-// with context 1000 reads those distributions and is trained to name the byte
-// each distribution was aimed at. Counts are fit on the first 90% of the file.
-// Training inputs use leave-one-out counts so a target is not packed into its
+// reads 2000 of those vectors. The first 1000 are sums of 1000 earlier
+// vectors each, folding the previous 1,000,000 vectors into the context.
+// The last 1000 are the raw distributions and are the ones that are scored.
+// Counts are fit on the first 90% of the file. Training inputs for those
+// scored rows use leave-one-out counts so a target is not packed into its
 // own distribution. Both models are scored on the held-out suffix.
 //
 // With -prompt, the sample line and the MCTS line are both random draws from
@@ -80,8 +82,14 @@ func main() {
 	rng := rand.New(rand.NewSource(*seed))
 	weights := newTensors(cfg)
 	initTensors(weights, cfg, rng)
-	fmt.Printf("transformer layers=1 d=%d heads=%d dff=%d context=%d stride=%d params=%d\n",
-		cfg.D, cfg.Heads, cfg.DFF, cfg.Context, stride, paramCount(weights))
+	fmt.Println("summing markov distributions for the compressed context...")
+	tPre := time.Now()
+	pre := markov.buildDistPrefix(data)
+	fmt.Printf("distribution prefix vectors=%d bytes=%d fit=%s\n",
+		pre.n, len(pre.sum)*8, time.Since(tPre).Round(time.Millisecond))
+
+	fmt.Printf("transformer layers=1 d=%d heads=%d dff=%d context=%d compressed=%d group=%d stride=%d params=%d\n",
+		cfg.D, cfg.Heads, cfg.DFF, cfg.Context, cfg.Compressed, cfg.Group, stride, paramCount(weights))
 
 	tr0, trCount := countWindows(len(data), 0, trainEnd, cfg.Context, stride)
 	te0, teCount := countWindows(len(data), trainEnd, len(data), cfg.Context, stride)
@@ -91,7 +99,7 @@ func main() {
 	fmt.Printf("windows train=%d test=%d batch=%d steps=%d\n", trCount, teCount, *batch, *steps)
 
 	testStarts := spreadStarts(te0, teCount, stride, *evalN)
-	before := evaluate(weights, cfg, markov, data, testStarts, false)
+	before := evaluate(weights, cfg, markov, pre, data, testStarts, false)
 	fmt.Printf("transformer test before n=%d acc=%.4f ce=%.4f bits=%.4f\n", before.n, before.acc(), before.ce(), before.bits())
 
 	opt := newAdam(weights)
@@ -103,7 +111,7 @@ func main() {
 		for i := range starts {
 			starts[i] = tr0 + rng.Intn(trCount)*stride
 		}
-		loss, acc, gnorm := trainStep(weights, cfg, markov, data, starts, true, workers)
+		loss, acc, gnorm := trainStep(weights, cfg, markov, pre, data, starts, true, workers)
 		rate := learningRate(step, 10, *lr)
 		clipGrads(workers.grad, 1)
 		opt.step(weights, workers.grad, float32(rate))
@@ -114,13 +122,13 @@ func main() {
 		}
 	}
 
-	after := evaluate(weights, cfg, markov, data, testStarts, false)
+	after := evaluate(weights, cfg, markov, pre, data, testStarts, false)
 	same := markovOnStarts(markov, data, testStarts, cfg.Context, false)
 	fmt.Printf("transformer test after  n=%d acc=%.4f ce=%.4f bits=%.4f\n", after.n, after.acc(), after.ce(), after.bits())
 	fmt.Printf("markov same windows     n=%d acc=%.4f ce=%.4f bits=%.4f\n", same.n, same.acc(), same.ce(), same.bits())
 	fmt.Printf("train last-batch loss=%.4f  held-out ce %.4f -> %.4f (delta %.4f nats)\n",
 		lastLoss, before.ce(), after.ce(), before.ce()-after.ce())
-	printSample(weights, cfg, markov, data, testStarts[0])
+	printSample(weights, cfg, markov, pre, data, testStarts[0])
 
 	if *prompt != "" {
 		fmt.Printf("sample prompt=%s gen=%d sims=%d temp=%g\n", strconv.Quote(*prompt), *genN, *sims, *temp)
@@ -161,15 +169,15 @@ func newWorkers(cfg Config, n int) *crew {
 	for i := range c.slots {
 		c.slots[i] = slot{
 			g:       newTensors(cfg),
-			ws:      newWorkspace(cfg, cfg.Context),
-			x:       make([]float32, cfg.Context*cfg.Vocab),
-			targets: make([]byte, cfg.Context),
+			ws:      newWorkspace(cfg, cfg.seqLen()),
+			x:       make([]float32, cfg.seqLen()*cfg.Vocab),
+			targets: make([]byte, cfg.seqLen()),
 		}
 	}
 	return c
 }
 
-func trainStep(w *tensors, cfg Config, m *Markov, data []byte, starts []int, loo bool, c *crew) (loss, acc, gnorm float64) {
+func trainStep(w *tensors, cfg Config, m *Markov, pre *distPrefix, data []byte, starts []int, loo bool, c *crew) (loss, acc, gnorm float64) {
 	c.grad.zero()
 	errc := make(chan error, len(starts))
 	type result struct {
@@ -186,7 +194,7 @@ func trainStep(w *tensors, cfg Config, m *Markov, data []byte, starts []int, loo
 				}
 			}()
 			s := &c.slots[i]
-			m.Fill(data, starts[i], cfg.Context, loo, s.x, s.targets)
+			m.WriteWindow(data, starts[i], cfg.Context, cfg.Compressed, cfg.Group, loo, pre, s.x, s.targets[cfg.Compressed:])
 			loss, correct := forwardBackward(cfg, w, s.g, s.ws, s.x, s.targets)
 			results[i] = result{loss: loss, correct: correct}
 			errc <- nil
@@ -210,13 +218,13 @@ func trainStep(w *tensors, cfg Config, m *Markov, data []byte, starts []int, loo
 	return loss, acc, gradNorm(c.grad)
 }
 
-func evaluate(w *tensors, cfg Config, m *Markov, data []byte, starts []int, loo bool) score {
+func evaluate(w *tensors, cfg Config, m *Markov, pre *distPrefix, data []byte, starts []int, loo bool) score {
 	var total score
-	ws := newWorkspace(cfg, cfg.Context)
-	x := make([]float32, cfg.Context*cfg.Vocab)
-	targets := make([]byte, cfg.Context)
+	ws := newWorkspace(cfg, cfg.seqLen())
+	x := make([]float32, cfg.seqLen()*cfg.Vocab)
+	targets := make([]byte, cfg.seqLen())
 	for _, s := range starts {
-		m.Fill(data, s, cfg.Context, loo, x, targets)
+		m.WriteWindow(data, s, cfg.Context, cfg.Compressed, cfg.Group, loo, pre, x, targets[cfg.Compressed:])
 		loss, correct := forwardBackward(cfg, w, nil, ws, x, targets)
 		total.nll += loss * float64(cfg.Context)
 		total.correct += correct
@@ -244,11 +252,11 @@ func markovOnStarts(m *Markov, data []byte, starts []int, context int, loo bool)
 	return total
 }
 
-func printSample(w *tensors, cfg Config, m *Markov, data []byte, start int) {
-	ws := newWorkspace(cfg, cfg.Context)
-	x := make([]float32, cfg.Context*cfg.Vocab)
-	targets := make([]byte, cfg.Context)
-	m.Fill(data, start, cfg.Context, false, x, targets)
+func printSample(w *tensors, cfg Config, m *Markov, pre *distPrefix, data []byte, start int) {
+	ws := newWorkspace(cfg, cfg.seqLen())
+	x := make([]float32, cfg.seqLen()*cfg.Vocab)
+	targets := make([]byte, cfg.seqLen())
+	m.WriteWindow(data, start, cfg.Context, cfg.Compressed, cfg.Group, false, pre, x, targets[cfg.Compressed:])
 	forwardBackward(cfg, w, nil, ws, x, targets)
 	fmt.Printf("sample test window byte %d (every 4th next-byte)\n", start)
 	fmt.Printf("%-10s %-8s %-14s %s\n", "context", "actual", "markov", "transformer")
@@ -266,7 +274,8 @@ func printSample(w *tensors, cfg Config, m *Markov, data []byte, start int) {
 				mode = i
 			}
 		}
-		pred, pp := argmaxRow(ws.logits[j*cfg.Vocab : (j+1)*cfg.Vocab])
+		row := cfg.Compressed + j
+		pred, pp := argmaxRow(ws.logits[row*cfg.Vocab : (row+1)*cfg.Vocab])
 		fmt.Printf("%-10s %-8s %-14s %s p=%.3f\n",
 			strconv.Quote(string(ctx[:])),
 			strconv.Quote(string([]byte{tgt})),

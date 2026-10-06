@@ -314,3 +314,129 @@ func (m *Markov) Fill(data []byte, s, T int, loo bool, x []float32, targets []by
 		m.Dist(ctx, tgt, loo, x[j*vocab:(j+1)*vocab])
 	}
 }
+
+// distPrefix holds exclusive prefix sums of the stride-aligned raw rows.
+// sum[(k+1)*vocab:(k+2)*vocab] is the sum of rows [0, k].
+// Rows are non-leave-one-out. A compressed bucket is a difference of two entries.
+type distPrefix struct {
+	sum []float64
+	n   int
+}
+
+func (m *Markov) buildDistPrefix(data []byte) *distPrefix {
+	n := 0
+	if len(data) > order {
+		n = (len(data) - order) / stride
+	}
+	p := &distPrefix{sum: make([]float64, (n+1)*vocab), n: n}
+	var ctx markovKey
+	var row [vocab]float32
+	for k := 0; k < n; k++ {
+		off := k * stride
+		copy(ctx[:], data[off:off+order])
+		m.Dist(ctx, 0, false, row[:])
+		src := p.sum[k*vocab:]
+		dst := p.sum[(k+1)*vocab:]
+		for b, v := range row {
+			dst[b] = src[b] + float64(v)
+		}
+	}
+	return p
+}
+
+// sumInto writes the sum of raw rows [lo, hi) into out.
+// Indexes before 0 or at or after n contribute nothing.
+func (p *distPrefix) sumInto(lo, hi int, out []float32) {
+	if len(out) != vocab {
+		panic("sum length")
+	}
+	if lo < 0 {
+		lo = 0
+	}
+	if hi > p.n {
+		hi = p.n
+	}
+	if hi <= lo {
+		clear(out)
+		return
+	}
+	a := p.sum[lo*vocab:]
+	b := p.sum[hi*vocab:]
+	for i := range out {
+		out[i] = float32(b[i] - a[i])
+	}
+}
+
+// WriteWindow writes compressed sums and then raw rows for a window opened at s.
+// Bucket i, oldest first, is the sum of Group raw rows in the block of
+// Compressed*Group rows immediately before s. Rows that would start before
+// the buffer are skipped, so a short prefix leaves leading buckets at zero.
+// pre, when set, supplies those sums and s must be a multiple of stride.
+// targets receives one label per raw row. History sums do not use leave-one-out.
+func (m *Markov) WriteWindow(data []byte, s, raw, compressed, group int, loo bool, pre *distPrefix, x []float32, targets []byte) {
+	if raw < 1 || compressed < 0 || (compressed > 0 && group < 1) {
+		panic("window")
+	}
+	span := compressed + raw
+	if len(targets) != raw || len(x) != span*vocab {
+		panic("window length")
+	}
+	clear(x[:compressed*vocab])
+	if compressed > 0 {
+		keep := compressed * group
+		if pre != nil {
+			if s%stride != 0 {
+				panic("window alignment")
+			}
+			v := s / stride
+			for i := 0; i < compressed; i++ {
+				lo := v - keep + i*group
+				pre.sumInto(lo, lo+group, x[i*vocab:(i+1)*vocab])
+			}
+		} else {
+			for i := 0; i < compressed; i++ {
+				row := x[i*vocab : (i+1)*vocab]
+				base := -keep + i*group
+				for g := 0; g < group; g++ {
+					off := s + stride*(base+g)
+					if off < 0 {
+						continue
+					}
+					m.accumulate(data, off, row)
+				}
+			}
+		}
+	}
+	var ctx markovKey
+	base := compressed * vocab
+	for j := 0; j < raw; j++ {
+		off := s + stride*j
+		if off < 0 || off+order > len(data) {
+			panic("window past end")
+		}
+		copy(ctx[:], data[off:off+order])
+		var tgt byte
+		if off+order < len(data) {
+			tgt = data[off+order]
+		} else if loo {
+			panic("window past end")
+		}
+		targets[j] = tgt
+		m.Dist(ctx, tgt, loo, x[base+j*vocab:base+(j+1)*vocab])
+	}
+}
+
+// accumulate adds the non-leave-one-out row at byte off onto acc.
+// off+order may equal len(data); the target byte is not read.
+func (m *Markov) accumulate(data []byte, off int, acc []float32) {
+	if off < 0 || off+order > len(data) {
+		panic("accumulate")
+	}
+	var ctx markovKey
+	copy(ctx[:], data[off:off+order])
+	var row [vocab]float32
+	m.Dist(ctx, 0, false, row[:])
+	for i := range acc {
+		acc[i] += row[i]
+	}
+}
