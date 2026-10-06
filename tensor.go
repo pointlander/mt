@@ -4,21 +4,42 @@
 
 package main
 
-import "math"
+import (
+	"math"
+	"simd"
+)
 
 func sqrt32(x float32) float32 { return float32(math.Sqrt(float64(x))) }
 func exp32(x float32) float32  { return float32(math.Exp(float64(x))) }
 
-func dot(a, b []float32) float32 {
-	n := len(a)
-	if len(b) < n {
+func dot(x, y []float32) float32 {
+	n := len(x)
+	if len(y) < n {
 		panic("dot length")
 	}
-	var s float32
-	for i := 0; i < n; i++ {
-		s += a[i] * b[i]
+	var a simd.Float32s
+	var i int
+	for i = 0; i < len(x)-a.Len()+1; i += a.Len() {
+		u := simd.LoadFloat32s(x[i : i+a.Len()])
+		v := simd.LoadFloat32s(y[i : i+a.Len()])
+		a = u.MulAdd(v, a)
 	}
-	return s
+	if i < len(x) {
+		u, _ := simd.LoadFloat32sPart(x[i:])
+		v, _ := simd.LoadFloat32sPart(y[i:])
+		a = u.MulAdd(v, a)
+	}
+	return sum(a)
+}
+
+func sum(x simd.Float32s) float32 {
+	s := make([]float32, x.Len())
+	x.Store(s)
+	var r float32
+	for _, e := range s {
+		r += e
+	}
+	return r
 }
 
 // mul sets C = A @ B. A is [M, K], B is [K, N], C is [M, N], all row-major.
