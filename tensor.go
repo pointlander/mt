@@ -42,6 +42,31 @@ func sum(x simd.Float32s) float32 {
 	return r
 }
 
+// axpy adds a*x to y. A zero scale leaves y unchanged, including NaNs in x.
+func axpy(y, x []float32, a float32) {
+	n := len(x)
+	if len(y) < n {
+		panic("axpy length")
+	}
+	if a == 0 || n == 0 {
+		return
+	}
+	var lane simd.Float32s
+	w := lane.Len()
+	scale := simd.BroadcastFloat32s(a)
+	i := 0
+	for ; i+w <= n; i += w {
+		yv := simd.LoadFloat32s(y[i : i+w])
+		xv := simd.LoadFloat32s(x[i : i+w])
+		xv.MulAdd(scale, yv).Store(y[i : i+w])
+	}
+	if i < n {
+		yv, _ := simd.LoadFloat32sPart(y[i:n])
+		xv, _ := simd.LoadFloat32sPart(x[i:n])
+		xv.MulAdd(scale, yv).StorePart(y[i:n])
+	}
+}
+
 // mul sets C = A @ B. A is [M, K], B is [K, N], C is [M, N], all row-major.
 func mul(A []float32, M, K int, B []float32, N int, C []float32) {
 	if len(A) < M*K || len(B) < K*N || len(C) < M*N {
@@ -58,10 +83,7 @@ func mul(A []float32, M, K int, B []float32, N int, C []float32) {
 			if a == 0 {
 				continue
 			}
-			bp := B[p*N : p*N+N]
-			for j := 0; j < N; j++ {
-				ci[j] += a * bp[j]
-			}
+			axpy(ci, B[p*N:p*N+N], a)
 		}
 	}
 }
@@ -82,10 +104,7 @@ func mulAT(A []float32, K, M int, B []float32, N int, C []float32) {
 			if a == 0 {
 				continue
 			}
-			cm := C[m*N : m*N+N]
-			for n := 0; n < N; n++ {
-				cm[n] += a * bk[n]
-			}
+			axpy(C[m*N:m*N+N], bk, a)
 		}
 	}
 }

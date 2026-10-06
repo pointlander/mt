@@ -185,10 +185,7 @@ func attnForward(q, k, v []float32, T, H, Dh int, scale float32, scores, attn, c
 			for j := 0; j <= i; j++ {
 				a := rowA[j] * inv
 				rowA[j] = a
-				vj := v[j*D+h*Dh : j*D+h*Dh+Dh]
-				for d := 0; d < Dh; d++ {
-					out[d] += a * vj[d]
-				}
+				axpy(out, v[j*D+h*Dh:j*D+h*Dh+Dh], a)
 			}
 			for j := i + 1; j < T; j++ {
 				rowS[j] = 0
@@ -214,11 +211,7 @@ func attnBackward(q, k, v, attn, dctx []float32, T, H, Dh int, scale float32, dq
 				dA := dot(dci, v[j*D+h*Dh:j*D+h*Dh+Dh])
 				rowD[j] = dA
 				dotA += dA * rowA[j]
-				dvj := dv[j*D+h*Dh : j*D+h*Dh+Dh]
-				a := rowA[j]
-				for d := 0; d < Dh; d++ {
-					dvj[d] += a * dci[d]
-				}
+				axpy(dv[j*D+h*Dh:j*D+h*Dh+Dh], dci, rowA[j])
 			}
 			for j := 0; j <= i; j++ {
 				rowD[j] = rowA[j] * (rowD[j] - dotA) * scale
@@ -233,12 +226,8 @@ func attnBackward(q, k, v, attn, dctx []float32, T, H, Dh int, scale float32, dq
 			rowD := dS[base+i*T : base+i*T+T]
 			for j := 0; j <= i; j++ {
 				ds := rowD[j]
-				kj := k[j*D+h*Dh : j*D+h*Dh+Dh]
-				dkj := dk[j*D+h*Dh : j*D+h*Dh+Dh]
-				for d := 0; d < Dh; d++ {
-					dqi[d] += ds * kj[d]
-					dkj[d] += ds * qi[d]
-				}
+				axpy(dqi, k[j*D+h*Dh:j*D+h*Dh+Dh], ds)
+				axpy(dk[j*D+h*Dh:j*D+h*Dh+Dh], qi, ds)
 			}
 		}
 	}

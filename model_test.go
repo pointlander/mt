@@ -45,6 +45,57 @@ func TestMul(t *testing.T) {
 			t.Fatalf("mulBT got %v", Cb)
 		}
 	}
+
+	// Widths below, equal to, and above the SIMD lane count, with a zero scale.
+	const M, K, N = 3, 5, 7
+	Aw := make([]float32, M*K)
+	Bw := make([]float32, K*N)
+	for i := range Aw {
+		Aw[i] = float32((i % 5) - 2)
+	}
+	Aw[K+1] = 0
+	for i := range Bw {
+		Bw[i] = float32((i % 4) - 1)
+	}
+	Cw := make([]float32, M*N)
+	mul(Aw, M, K, Bw, N, Cw)
+	for i := 0; i < M; i++ {
+		for j := 0; j < N; j++ {
+			var s float32
+			for p := 0; p < K; p++ {
+				s += Aw[i*K+p] * Bw[p*N+j]
+			}
+			if Cw[i*N+j] != s {
+				t.Fatalf("wide mul [%d,%d] %g != %g", i, j, Cw[i*N+j], s)
+			}
+		}
+	}
+	AwT := make([]float32, K*M)
+	for k := 0; k < K; k++ {
+		for m := 0; m < M; m++ {
+			AwT[k*M+m] = Aw[m*K+k]
+		}
+	}
+	CwT := make([]float32, M*N)
+	mulAT(AwT, K, M, Bw, N, CwT)
+	for i := range Cw {
+		if CwT[i] != Cw[i] {
+			t.Fatalf("wide mulAT %v != %v", CwT, Cw)
+		}
+	}
+	BwT := make([]float32, N*K)
+	for n := 0; n < N; n++ {
+		for k := 0; k < K; k++ {
+			BwT[n*K+k] = Bw[k*N+n]
+		}
+	}
+	CwBT := make([]float32, M*N)
+	mulBT(Aw, M, K, BwT, N, CwBT)
+	for i := range Cw {
+		if CwBT[i] != Cw[i] {
+			t.Fatalf("wide mulBT %v != %v", CwBT, Cw)
+		}
+	}
 }
 
 func TestLayerNormGrad(t *testing.T) {
