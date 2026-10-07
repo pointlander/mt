@@ -6,7 +6,7 @@ The default corpus is [`pg100.txt`](pg100.txt), Project Gutenberg eBook #100, *T
 
 ## Build
 
-Go 1.25. The matrix kernels use the experimental `simd` package, so set `GOEXPERIMENT=simd` for every build and test.
+Go 1.27.1. The matrix kernels use the experimental `simd` package, so set `GOEXPERIMENT=simd` for every build and test.
 
 ```bash
 GOEXPERIMENT=simd go test
