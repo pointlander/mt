@@ -1,6 +1,10 @@
 # Built binary (`go build` in this module)
 /mt
 
+# Trained models written by a training run
+/markov.bin
+/weights.bin
+
 # Binaries for programs and plugins
 *.exe
 *.exe~

@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"math"
 	"math/rand"
 	"os"
@@ -521,6 +522,99 @@ func TestMarkovPG100(t *testing.T) {
 	strideScore := m.Evaluate(data, trainEnd, len(data), stride, false)
 	if strideScore.n < 1000 || strideScore.acc() < 0.2 {
 		t.Fatalf("stride score %+v acc=%g", strideScore, strideScore.acc())
+	}
+}
+
+func TestCheckpointRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	markovPath := dir + "/markov.bin"
+	weightsPath := dir + "/weights.bin"
+
+	data := []byte("abracadabra abracadabra")
+	m := newMarkov()
+	m.Train(data, len(data))
+	if err := saveMarkov(markovPath, m); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadMarkov(markovPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.observations != m.observations || len(got.tab) != len(m.tab) {
+		t.Fatalf("obs %d/%d entries %d/%d", got.observations, m.observations, len(got.tab), len(m.tab))
+	}
+	for k, e := range m.tab {
+		f := got.tab[k]
+		if f == nil || f.total != e.total || !bytes.Equal(f.sym, e.sym) || len(f.cnt) != len(e.cnt) {
+			t.Fatalf("entry n=%d %q", k.n, k.b[:k.n])
+		}
+		for i := range e.cnt {
+			if f.cnt[i] != e.cnt[i] {
+				t.Fatalf("count %d", i)
+			}
+		}
+	}
+	var ctx markovKey
+	copy(ctx[:], data[:order])
+	var a, b [vocab]float32
+	m.Dist(ctx, data[order], true, a[:])
+	got.Dist(ctx, data[order], true, b[:])
+	for i := range a {
+		if a[i] != b[i] {
+			t.Fatalf("dist %d %g != %g", i, a[i], b[i])
+		}
+	}
+
+	cfg := Config{Vocab: 4, Context: 2, D: 4, Heads: 2, DFF: 8}
+	w := newTensors(cfg)
+	for _, p := range w.list() {
+		for i := range p {
+			p[i] = float32(i)*0.5 + 1
+		}
+	}
+	if err := saveWeights(weightsPath, cfg, w); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadWeights(weightsPath, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, p := range w.list() {
+		q := loaded.list()[i]
+		for j := range p {
+			if q[j] != p[j] {
+				t.Fatalf("weight %d %d %g != %g", i, j, q[j], p[j])
+			}
+		}
+	}
+	other := cfg
+	other.D = 8
+	if _, err := loadWeights(weightsPath, other); err == nil {
+		t.Fatal("expected config mismatch")
+	}
+
+	f, err := os.OpenFile(markovPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(info.Size() - 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadMarkov(markovPath); err == nil {
+		t.Fatal("expected truncated markov to fail")
+	}
+	if err := os.WriteFile(dir+"/bad.bin", []byte("nope"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadMarkov(dir + "/bad.bin"); err == nil {
+		t.Fatal("expected bad magic")
 	}
 }
 

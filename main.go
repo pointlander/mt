@@ -13,6 +13,8 @@
 // Counts are fit on the first 90% of the file. Training inputs for those
 // scored rows use leave-one-out counts so a target is not packed into its
 // own distribution. Both models are scored on the held-out suffix.
+// If markov.bin and weights.bin are both present they are loaded and
+// training is skipped. A training run writes both files.
 //
 // With -prompt, the sample line and the MCTS line are both random draws from
 // the tempered softmax. -temp scales that softmax. The MCTS line is the last
@@ -63,13 +65,50 @@ func main() {
 	trainEnd := int(float64(len(data)) * trainFraction)
 	fmt.Printf("corpus pg100.txt bytes=%d train=%d test=%d\n", len(data), trainEnd, len(data)-trainEnd)
 
-	fmt.Println("fitting markov counts for orders 4, 3, 2, and 1...")
-	markov := newMarkov()
-	t0 := time.Now()
-	markov.Train(data, trainEnd)
-	n4, n3, n2, n1 := markov.Orders()
-	fmt.Printf("markov contexts 4=%d 3=%d 2=%d 1=%d observations=%d fit=%s\n",
-		n4, n3, n2, n1, markov.observations, time.Since(t0).Round(time.Millisecond))
+	cfg := defaultConfig()
+	rng := rand.New(rand.NewSource(*seed))
+	haveMarkov, err := fileExists(markovFile)
+	if err != nil {
+		panic(err)
+	}
+	haveWeights, err := fileExists(weightsFile)
+	if err != nil {
+		panic(err)
+	}
+	if haveMarkov != haveWeights {
+		fmt.Printf("need both %s and %s, or neither\n", markovFile, weightsFile)
+		os.Exit(1)
+	}
+
+	var markov *Markov
+	var weights *tensors
+	loaded := haveMarkov && haveWeights
+	if loaded {
+		t0 := time.Now()
+		markov, err = loadMarkov(markovFile)
+		if err != nil {
+			panic(err)
+		}
+		n4, n3, n2, n1 := markov.Orders()
+		fmt.Printf("loaded %s contexts 4=%d 3=%d 2=%d 1=%d observations=%d %s\n",
+			markovFile, n4, n3, n2, n1, markov.observations, time.Since(t0).Round(time.Millisecond))
+		t1 := time.Now()
+		weights, err = loadWeights(weightsFile, cfg)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("loaded %s params=%d %s\n", weightsFile, paramCount(weights), time.Since(t1).Round(time.Millisecond))
+	} else {
+		fmt.Println("fitting markov counts for orders 4, 3, 2, and 1...")
+		markov = newMarkov()
+		t0 := time.Now()
+		markov.Train(data, trainEnd)
+		n4, n3, n2, n1 := markov.Orders()
+		fmt.Printf("markov contexts 4=%d 3=%d 2=%d 1=%d observations=%d fit=%s\n",
+			n4, n3, n2, n1, markov.observations, time.Since(t0).Round(time.Millisecond))
+		weights = newTensors(cfg)
+		initTensors(weights, cfg, rng)
+	}
 
 	trainLOO := markov.Evaluate(data, order, trainEnd, 1, true)
 	testAll := markov.Evaluate(data, trainEnd, len(data), 1, false)
@@ -78,10 +117,6 @@ func main() {
 	fmt.Printf("markov test        n=%d acc=%.4f ce=%.4f bits=%.4f\n", testAll.n, testAll.acc(), testAll.ce(), testAll.bits())
 	fmt.Printf("markov test-stride n=%d acc=%.4f ce=%.4f bits=%.4f\n", testStride.n, testStride.acc(), testStride.ce(), testStride.bits())
 
-	cfg := defaultConfig()
-	rng := rand.New(rand.NewSource(*seed))
-	weights := newTensors(cfg)
-	initTensors(weights, cfg, rng)
 	fmt.Println("summing markov distributions for the compressed context...")
 	tPre := time.Now()
 	pre := markov.buildDistPrefix(data)
@@ -99,35 +134,49 @@ func main() {
 	fmt.Printf("windows train=%d test=%d batch=%d steps=%d\n", trCount, teCount, *batch, *steps)
 
 	testStarts := spreadStarts(te0, teCount, stride, *evalN)
-	before := evaluate(weights, cfg, markov, pre, data, testStarts, false)
-	fmt.Printf("transformer test before n=%d acc=%.4f ce=%.4f bits=%.4f\n", before.n, before.acc(), before.ce(), before.bits())
-
-	opt := newAdam(weights)
-	workers := newWorkers(cfg, *batch)
-	trainStart := time.Now()
+	var before score
 	var lastLoss float64
-	for step := 0; step < *steps; step++ {
-		starts := make([]int, *batch)
-		for i := range starts {
-			starts[i] = tr0 + rng.Intn(trCount)*stride
+	if !loaded {
+		before = evaluate(weights, cfg, markov, pre, data, testStarts, false)
+		fmt.Printf("transformer test before n=%d acc=%.4f ce=%.4f bits=%.4f\n", before.n, before.acc(), before.ce(), before.bits())
+
+		opt := newAdam(weights)
+		workers := newWorkers(cfg, *batch)
+		trainStart := time.Now()
+		for step := 0; step < *steps; step++ {
+			starts := make([]int, *batch)
+			for i := range starts {
+				starts[i] = tr0 + rng.Intn(trCount)*stride
+			}
+			loss, acc, gnorm := trainStep(weights, cfg, markov, pre, data, starts, true, workers)
+			rate := learningRate(step, 10, *lr)
+			clipGrads(workers.grad, 1)
+			opt.step(weights, workers.grad, float32(rate))
+			lastLoss = loss
+			if step%10 == 0 || step+1 == *steps {
+				fmt.Printf("step %3d/%d loss=%.4f acc=%.4f grad=%.3f lr=%.2e %s\n",
+					step+1, *steps, loss, acc, gnorm, rate, time.Since(trainStart).Round(time.Millisecond))
+			}
 		}
-		loss, acc, gnorm := trainStep(weights, cfg, markov, pre, data, starts, true, workers)
-		rate := learningRate(step, 10, *lr)
-		clipGrads(workers.grad, 1)
-		opt.step(weights, workers.grad, float32(rate))
-		lastLoss = loss
-		if step%10 == 0 || step+1 == *steps {
-			fmt.Printf("step %3d/%d loss=%.4f acc=%.4f grad=%.3f lr=%.2e %s\n",
-				step+1, *steps, loss, acc, gnorm, rate, time.Since(trainStart).Round(time.Millisecond))
+		if err = saveMarkov(markovFile, markov); err != nil {
+			panic(err)
 		}
+		if err = saveWeights(weightsFile, cfg, weights); err != nil {
+			panic(err)
+		}
+		fmt.Printf("saved %s and %s\n", markovFile, weightsFile)
 	}
 
 	after := evaluate(weights, cfg, markov, pre, data, testStarts, false)
 	same := markovOnStarts(markov, data, testStarts, cfg.Context, false)
 	fmt.Printf("transformer test after  n=%d acc=%.4f ce=%.4f bits=%.4f\n", after.n, after.acc(), after.ce(), after.bits())
 	fmt.Printf("markov same windows     n=%d acc=%.4f ce=%.4f bits=%.4f\n", same.n, same.acc(), same.ce(), same.bits())
-	fmt.Printf("train last-batch loss=%.4f  held-out ce %.4f -> %.4f (delta %.4f nats)\n",
-		lastLoss, before.ce(), after.ce(), before.ce()-after.ce())
+	if loaded {
+		fmt.Printf("held-out ce %.4f\n", after.ce())
+	} else {
+		fmt.Printf("train last-batch loss=%.4f  held-out ce %.4f -> %.4f (delta %.4f nats)\n",
+			lastLoss, before.ce(), after.ce(), before.ce()-after.ce())
+	}
 	printSample(weights, cfg, markov, pre, data, testStarts[0])
 
 	if *prompt != "" {
@@ -145,7 +194,7 @@ func main() {
 		fmt.Println("verification failed: markov held-out fit is below the sanity bar")
 		os.Exit(1)
 	}
-	if after.acc() < 0.3 || after.ce() > 4 || !(after.ce() < before.ce()-0.5) {
+	if after.acc() < 0.3 || after.ce() > 4 || (!loaded && !(after.ce() < before.ce()-0.5)) {
 		fmt.Println("verification failed: transformer did not learn held-out next-byte prediction")
 		os.Exit(1)
 	}
