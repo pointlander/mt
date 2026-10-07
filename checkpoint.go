@@ -25,6 +25,13 @@ const (
 	fileVersion  = 1
 )
 
+func checkpointNames(books int) (string, string) {
+	if books > 0 {
+		return fmt.Sprintf("markov-g%d.bin", books), fmt.Sprintf("weights-g%d.bin", books)
+	}
+	return markovFile, weightsFile
+}
+
 func fileExists(path string) (bool, error) {
 	_, err := os.Stat(path)
 	if err == nil {

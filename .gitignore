@@ -4,6 +4,8 @@
 # Trained models written by a training run
 /markov.bin
 /weights.bin
+/markov-g*.bin
+/weights-g*.bin
 
 # Binaries for programs and plugins
 *.exe

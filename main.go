@@ -15,6 +15,8 @@
 // own distribution. Both models are scored on the held-out suffix.
 // If markov.bin and weights.bin are both present they are loaded and
 // training is skipped. A training run writes both files.
+// -gutenberg N reads the first N books in txt-files.tar.zip, trains one
+// pass over them, and uses markov-gN.bin and weights-gN.bin the same way.
 //
 // With -prompt, the sample line and the MCTS line are both random draws from
 // the tempered softmax. -temp scales that softmax. The MCTS line is the last
@@ -45,6 +47,7 @@ func main() {
 	genN := flag.Int("gen", 32, "bytes to generate from -prompt")
 	sims := flag.Int("sims", 1, "softmax samples for the MCTS line; the last one is printed")
 	temp := flag.Float64("temp", 1, "softmax temperature for generation")
+	gutenberg := flag.Int("gutenberg", 0, "one-shot train on the first N books in txt-files.tar.zip")
 	flag.Parse()
 	if *prompt != "" && len(*prompt) < order {
 		fmt.Println("prompt must be at least 4 bytes")
@@ -54,8 +57,23 @@ func main() {
 		fmt.Println("temperature must be positive")
 		os.Exit(1)
 	}
+	if *gutenberg < 0 {
+		fmt.Println("gutenberg count must be non-negative")
+		os.Exit(1)
+	}
 
-	data, err := os.ReadFile("pg100.txt")
+	var (
+		data []byte
+		err  error
+		read time.Duration
+	)
+	if *gutenberg > 0 {
+		tRead := time.Now()
+		data, err = gutenbergBooks("txt-files.tar.zip", *gutenberg)
+		read = time.Since(tRead)
+	} else {
+		data, err = os.ReadFile("pg100.txt")
+	}
 	if err != nil {
 		panic(err)
 	}
@@ -63,20 +81,26 @@ func main() {
 		*batch = runtime.GOMAXPROCS(0)
 	}
 	trainEnd := int(float64(len(data)) * trainFraction)
-	fmt.Printf("corpus pg100.txt bytes=%d train=%d test=%d\n", len(data), trainEnd, len(data)-trainEnd)
+	if *gutenberg > 0 {
+		fmt.Printf("corpus txt-files.tar.zip books=%d bytes=%d train=%d test=%d %s\n",
+			*gutenberg, len(data), trainEnd, len(data)-trainEnd, read.Round(time.Millisecond))
+	} else {
+		fmt.Printf("corpus pg100.txt bytes=%d train=%d test=%d\n", len(data), trainEnd, len(data)-trainEnd)
+	}
 
 	cfg := defaultConfig()
 	rng := rand.New(rand.NewSource(*seed))
-	haveMarkov, err := fileExists(markovFile)
+	mFile, wFile := checkpointNames(*gutenberg)
+	haveMarkov, err := fileExists(mFile)
 	if err != nil {
 		panic(err)
 	}
-	haveWeights, err := fileExists(weightsFile)
+	haveWeights, err := fileExists(wFile)
 	if err != nil {
 		panic(err)
 	}
 	if haveMarkov != haveWeights {
-		fmt.Printf("need both %s and %s, or neither\n", markovFile, weightsFile)
+		fmt.Printf("need both %s and %s, or neither\n", mFile, wFile)
 		os.Exit(1)
 	}
 
@@ -85,19 +109,19 @@ func main() {
 	loaded := haveMarkov && haveWeights
 	if loaded {
 		t0 := time.Now()
-		markov, err = loadMarkov(markovFile)
+		markov, err = loadMarkov(mFile)
 		if err != nil {
 			panic(err)
 		}
 		n4, n3, n2, n1 := markov.Orders()
 		fmt.Printf("loaded %s contexts 4=%d 3=%d 2=%d 1=%d observations=%d %s\n",
-			markovFile, n4, n3, n2, n1, markov.observations, time.Since(t0).Round(time.Millisecond))
+			mFile, n4, n3, n2, n1, markov.observations, time.Since(t0).Round(time.Millisecond))
 		t1 := time.Now()
-		weights, err = loadWeights(weightsFile, cfg)
+		weights, err = loadWeights(wFile, cfg)
 		if err != nil {
 			panic(err)
 		}
-		fmt.Printf("loaded %s params=%d %s\n", weightsFile, paramCount(weights), time.Since(t1).Round(time.Millisecond))
+		fmt.Printf("loaded %s params=%d %s\n", wFile, paramCount(weights), time.Since(t1).Round(time.Millisecond))
 	} else {
 		fmt.Println("fitting markov counts for orders 4, 3, 2, and 1...")
 		markov = newMarkov()
@@ -117,11 +141,28 @@ func main() {
 	fmt.Printf("markov test        n=%d acc=%.4f ce=%.4f bits=%.4f\n", testAll.n, testAll.acc(), testAll.ce(), testAll.bits())
 	fmt.Printf("markov test-stride n=%d acc=%.4f ce=%.4f bits=%.4f\n", testStride.n, testStride.acc(), testStride.ce(), testStride.bits())
 
-	fmt.Println("summing markov distributions for the compressed context...")
-	tPre := time.Now()
-	pre := markov.buildDistPrefix(data)
-	fmt.Printf("distribution prefix vectors=%d bytes=%d fit=%s\n",
-		pre.n, len(pre.sum)*8, time.Since(tPre).Round(time.Millisecond))
+	var pre *distPrefix
+	var sums []float32
+	if *gutenberg > 0 {
+		if !loaded {
+			fmt.Println("summing markov distributions into groups...")
+			tPre := time.Now()
+			sums = buildGroupSums(markov, data, cfg.Group)
+			nvec := 0
+			if len(data) > order {
+				nvec = (len(data) - order) / stride
+			}
+			ng := len(sums) / vocab
+			fmt.Printf("group sums groups=%d vectors=%d bytes=%d fit=%s\n",
+				ng, nvec, len(sums)*4, time.Since(tPre).Round(time.Millisecond))
+		}
+	} else {
+		fmt.Println("summing markov distributions for the compressed context...")
+		tPre := time.Now()
+		pre = markov.buildDistPrefix(data)
+		fmt.Printf("distribution prefix vectors=%d bytes=%d fit=%s\n",
+			pre.n, len(pre.sum)*8, time.Since(tPre).Round(time.Millisecond))
+	}
 
 	fmt.Printf("transformer layers=1 d=%d heads=%d dff=%d context=%d compressed=%d group=%d stride=%d params=%d\n",
 		cfg.D, cfg.Heads, cfg.DFF, cfg.Context, cfg.Compressed, cfg.Group, stride, paramCount(weights))
@@ -131,7 +172,13 @@ func main() {
 	if trCount < 1 || teCount < 1 {
 		panic("not enough text for a context window")
 	}
-	fmt.Printf("windows train=%d test=%d batch=%d steps=%d\n", trCount, teCount, *batch, *steps)
+	var shot []int
+	if *gutenberg > 0 {
+		shot = oneShotStarts(len(data), trainEnd, cfg.Context, cfg.Group, stride)
+		fmt.Printf("windows train=%d test=%d batch=%d one-shot=%d\n", trCount, teCount, *batch, len(shot))
+	} else {
+		fmt.Printf("windows train=%d test=%d batch=%d steps=%d\n", trCount, teCount, *batch, *steps)
+	}
 
 	testStarts := spreadStarts(te0, teCount, stride, *evalN)
 	var before score
@@ -140,31 +187,35 @@ func main() {
 		before = evaluate(weights, cfg, markov, pre, data, testStarts, false)
 		fmt.Printf("transformer test before n=%d acc=%.4f ce=%.4f bits=%.4f\n", before.n, before.acc(), before.ce(), before.bits())
 
-		opt := newAdam(weights)
-		workers := newWorkers(cfg, *batch)
-		trainStart := time.Now()
-		for step := 0; step < *steps; step++ {
-			starts := make([]int, *batch)
-			for i := range starts {
-				starts[i] = tr0 + rng.Intn(trCount)*stride
-			}
-			loss, acc, gnorm := trainStep(weights, cfg, markov, pre, data, starts, true, workers)
-			rate := learningRate(step, 10, *lr)
-			clipGrads(workers.grad, 1)
-			opt.step(weights, workers.grad, float32(rate))
-			lastLoss = loss
-			if step%10 == 0 || step+1 == *steps {
-				fmt.Printf("step %3d/%d loss=%.4f acc=%.4f grad=%.3f lr=%.2e %s\n",
-					step+1, *steps, loss, acc, gnorm, rate, time.Since(trainStart).Round(time.Millisecond))
+		if *gutenberg > 0 {
+			lastLoss = oneShotTrain(weights, cfg, markov, sums, data, shot, *batch, *lr)
+		} else {
+			opt := newAdam(weights)
+			workers := newWorkers(cfg, *batch)
+			trainStart := time.Now()
+			for step := 0; step < *steps; step++ {
+				starts := make([]int, *batch)
+				for i := range starts {
+					starts[i] = tr0 + rng.Intn(trCount)*stride
+				}
+				loss, acc, gnorm := trainStep(weights, cfg, markov, pre, data, starts, true, workers)
+				rate := learningRate(step, 10, *lr)
+				clipGrads(workers.grad, 1)
+				opt.step(weights, workers.grad, float32(rate))
+				lastLoss = loss
+				if step%10 == 0 || step+1 == *steps {
+					fmt.Printf("step %3d/%d loss=%.4f acc=%.4f grad=%.3f lr=%.2e %s\n",
+						step+1, *steps, loss, acc, gnorm, rate, time.Since(trainStart).Round(time.Millisecond))
+				}
 			}
 		}
-		if err = saveMarkov(markovFile, markov); err != nil {
+		if err = saveMarkov(mFile, markov); err != nil {
 			panic(err)
 		}
-		if err = saveWeights(weightsFile, cfg, weights); err != nil {
+		if err = saveWeights(wFile, cfg, weights); err != nil {
 			panic(err)
 		}
-		fmt.Printf("saved %s and %s\n", markovFile, weightsFile)
+		fmt.Printf("saved %s and %s\n", mFile, wFile)
 	}
 
 	after := evaluate(weights, cfg, markov, pre, data, testStarts, false)
@@ -227,13 +278,7 @@ func newWorkers(cfg Config, n int) *crew {
 }
 
 func trainStep(w *tensors, cfg Config, m *Markov, pre *distPrefix, data []byte, starts []int, loo bool, c *crew) (loss, acc, gnorm float64) {
-	c.grad.zero()
 	errc := make(chan error, len(starts))
-	type result struct {
-		loss    float64
-		correct int
-	}
-	results := make([]result, len(starts))
 	for i := range starts {
 		i := i
 		go func() {
@@ -244,12 +289,40 @@ func trainStep(w *tensors, cfg Config, m *Markov, pre *distPrefix, data []byte, 
 			}()
 			s := &c.slots[i]
 			m.WriteWindow(data, starts[i], cfg.Context, cfg.Compressed, cfg.Group, loo, pre, s.x, s.targets[cfg.Compressed:])
+			errc <- nil
+		}()
+	}
+	for range starts {
+		if err := <-errc; err != nil {
+			panic(err)
+		}
+	}
+	return forwardSlots(w, cfg, c, len(starts))
+}
+
+func forwardSlots(w *tensors, cfg Config, c *crew, n int) (loss, acc, gnorm float64) {
+	c.grad.zero()
+	errc := make(chan error, n)
+	type result struct {
+		loss    float64
+		correct int
+	}
+	results := make([]result, n)
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errc <- fmt.Errorf("%v\n%s", r, debug.Stack())
+				}
+			}()
+			s := &c.slots[i]
 			loss, correct := forwardBackward(cfg, w, s.g, s.ws, s.x, s.targets)
 			results[i] = result{loss: loss, correct: correct}
 			errc <- nil
 		}()
 	}
-	for range starts {
+	for range n {
 		if err := <-errc; err != nil {
 			panic(err)
 		}
@@ -260,10 +333,9 @@ func trainStep(w *tensors, cfg Config, m *Markov, pre *distPrefix, data []byte, 
 		correct += results[i].correct
 		addTensors(c.grad, c.slots[i].g)
 	}
-	n := float32(len(starts))
-	scaleTensors(c.grad, 1/n)
-	loss /= float64(len(starts))
-	acc = float64(correct) / float64(len(starts)*cfg.Context)
+	scaleTensors(c.grad, 1/float32(n))
+	loss /= float64(n)
+	acc = float64(correct) / float64(n*cfg.Context)
 	return loss, acc, gradNorm(c.grad)
 }
 
