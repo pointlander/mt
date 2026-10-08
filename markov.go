@@ -64,12 +64,7 @@ func suffixKey(ctx markovKey, n int) ctxKey {
 	return k
 }
 
-func (m *Markov) observe(key ctxKey, next byte) {
-	e := m.tab[key]
-	if e == nil {
-		e = &markovEntry{}
-		m.tab[key] = e
-	}
+func (e *markovEntry) add(next byte) {
 	for i, s := range e.sym {
 		if s == next {
 			e.cnt[i]++
@@ -80,6 +75,15 @@ func (m *Markov) observe(key ctxKey, next byte) {
 	e.sym = append(e.sym, next)
 	e.cnt = append(e.cnt, 1)
 	e.total++
+}
+
+func (m *Markov) observe(key ctxKey, next byte) {
+	e := m.tab[key]
+	if e == nil {
+		e = &markovEntry{}
+		m.tab[key] = e
+	}
+	e.add(next)
 }
 
 // Train counts next-byte transitions for every context length from 1 through order.
