@@ -16,7 +16,8 @@
 // If markov.bin and weights.bin are both present they are loaded and
 // training is skipped. A training run writes both files.
 // -gutenberg N reads the first N books in txt-files.tar.zip, trains one
-// pass over them, and uses markov-gN.bin and weights-gN.bin the same way.
+// pass over them and over train-v2.0.json, and uses markov-gN.bin and
+// weights-gN.bin the same way.
 //
 // With -prompt, the sample line and the MCTS line are both random draws from
 // the tempered softmax. -temp scales that softmax. The MCTS line is the last
@@ -47,7 +48,7 @@ func main() {
 	genN := flag.Int("gen", 32, "bytes to generate from -prompt")
 	sims := flag.Int("sims", 1, "softmax samples for the MCTS line; the last one is printed")
 	temp := flag.Float64("temp", 1, "softmax temperature for generation")
-	gutenberg := flag.Int("gutenberg", 0, "one-shot train on the first N books in txt-files.tar.zip")
+	gutenberg := flag.Int("gutenberg", 0, "one-shot train on the first N books in txt-files.tar.zip and on train-v2.0.json")
 	flag.Parse()
 	if *prompt != "" && len(*prompt) < order {
 		fmt.Println("prompt must be at least 4 bytes")
@@ -106,6 +107,7 @@ func main() {
 
 	var markov *Markov
 	var weights *tensors
+	var qa []byte
 	loaded := haveMarkov && haveWeights
 	if loaded {
 		t0 := time.Now()
@@ -127,6 +129,17 @@ func main() {
 		markov = newMarkov()
 		t0 := time.Now()
 		markov.Train(data, trainEnd)
+		if *gutenberg > 0 {
+			var nQA int
+			tQA := time.Now()
+			qa, nQA, err = squadTrainText(squadFile)
+			if err != nil {
+				panic(err)
+			}
+			fmt.Printf("corpus %s examples=%d bytes=%d %s\n",
+				squadFile, nQA, len(qa), time.Since(tQA).Round(time.Millisecond))
+			markov.Train(qa, len(qa))
+		}
 		n4, n3, n2, n1 := markov.Orders()
 		fmt.Printf("markov contexts 4=%d 3=%d 2=%d 1=%d observations=%d fit=%s\n",
 			n4, n3, n2, n1, markov.observations, time.Since(t0).Round(time.Millisecond))
@@ -143,6 +156,7 @@ func main() {
 
 	var pre *distPrefix
 	var sums []float32
+	var qaSums []float32
 	if *gutenberg > 0 {
 		if !loaded {
 			fmt.Println("summing markov distributions into groups...")
@@ -155,6 +169,14 @@ func main() {
 			ng := len(sums) / vocab
 			fmt.Printf("group sums groups=%d vectors=%d bytes=%d fit=%s\n",
 				ng, nvec, len(sums)*4, time.Since(tPre).Round(time.Millisecond))
+			tQA := time.Now()
+			qaSums = buildGroupSums(markov, qa, cfg.Group)
+			nvec = 0
+			if len(qa) > order {
+				nvec = (len(qa) - order) / stride
+			}
+			fmt.Printf("group sums squad groups=%d vectors=%d bytes=%d fit=%s\n",
+				len(qaSums)/vocab, nvec, len(qaSums)*4, time.Since(tQA).Round(time.Millisecond))
 		}
 	} else {
 		fmt.Println("summing markov distributions for the compressed context...")
@@ -173,9 +195,15 @@ func main() {
 		panic("not enough text for a context window")
 	}
 	var shot []int
+	var qaShot []int
 	if *gutenberg > 0 {
 		shot = oneShotStarts(len(data), trainEnd, cfg.Context, cfg.Group, stride)
-		fmt.Printf("windows train=%d test=%d batch=%d one-shot=%d\n", trCount, teCount, *batch, len(shot))
+		if !loaded {
+			qaShot = oneShotStarts(len(qa), len(qa), cfg.Context, cfg.Group, stride)
+			fmt.Printf("windows train=%d test=%d batch=%d one-shot=%d squad=%d\n", trCount, teCount, *batch, len(shot), len(qaShot))
+		} else {
+			fmt.Printf("windows train=%d test=%d batch=%d one-shot=%d\n", trCount, teCount, *batch, len(shot))
+		}
 	} else {
 		fmt.Printf("windows train=%d test=%d batch=%d steps=%d\n", trCount, teCount, *batch, *steps)
 	}
@@ -188,7 +216,10 @@ func main() {
 		fmt.Printf("transformer test before n=%d acc=%.4f ce=%.4f bits=%.4f\n", before.n, before.acc(), before.ce(), before.bits())
 
 		if *gutenberg > 0 {
-			lastLoss = oneShotTrain(weights, cfg, markov, sums, data, shot, *batch, *lr)
+			lastLoss = oneShotTrainSegs(weights, cfg, markov, []shotSeg{
+				{sums: sums, data: data, starts: shot},
+				{sums: qaSums, data: qa, starts: qaShot},
+			}, *batch, *lr)
 		} else {
 			opt := newAdam(weights)
 			workers := newWorkers(cfg, *batch)

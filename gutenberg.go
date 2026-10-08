@@ -169,27 +169,52 @@ func oneShotStarts(n, trainEnd, context, group, step int) []int {
 	return out
 }
 
+// shotSeg is one corpus slice whose group sums match its own byte offsets.
+type shotSeg struct {
+	sums   []float32
+	data   []byte
+	starts []int
+}
+
+type shotRef struct {
+	sums []float32
+	data []byte
+	s    int
+}
+
 // oneShotTrain takes one Adam step per batch of consecutive windows.
 // Slots are filled on this goroutine, then the backward passes run together.
 func oneShotTrain(w *tensors, cfg Config, m *Markov, sums []float32, data []byte, starts []int, batch int, lr float64) float64 {
-	if batch < 1 || len(starts) < 1 {
+	return oneShotTrainSegs(w, cfg, m, []shotSeg{{sums: sums, data: data, starts: starts}}, batch, lr)
+}
+
+// oneShotTrainSegs trains each segment in order with one Adam state.
+func oneShotTrainSegs(w *tensors, cfg Config, m *Markov, segs []shotSeg, batch int, lr float64) float64 {
+	var refs []shotRef
+	for _, seg := range segs {
+		for _, s := range seg.starts {
+			refs = append(refs, shotRef{sums: seg.sums, data: seg.data, s: s})
+		}
+	}
+	if batch < 1 || len(refs) < 1 {
 		panic("one-shot batch")
 	}
 	opt := newAdam(w)
 	workers := newWorkers(cfg, batch)
-	nSteps := (len(starts) + batch - 1) / batch
+	nSteps := (len(refs) + batch - 1) / batch
 	trainStart := time.Now()
 	var lastLoss float64
 	for step := 0; step < nSteps; step++ {
 		lo := step * batch
 		hi := lo + batch
-		if hi > len(starts) {
-			hi = len(starts)
+		if hi > len(refs) {
+			hi = len(refs)
 		}
 		n := hi - lo
 		for i := 0; i < n; i++ {
+			r := refs[lo+i]
 			s := &workers.slots[i]
-			writeGroupedWindow(m, sums, data, starts[lo+i], cfg.Context, cfg.Compressed, cfg.Group, true, s.x, s.targets[cfg.Compressed:])
+			writeGroupedWindow(m, r.sums, r.data, r.s, cfg.Context, cfg.Compressed, cfg.Group, true, s.x, s.targets[cfg.Compressed:])
 		}
 		loss, acc, gnorm := forwardSlots(w, cfg, workers, n)
 		rate := learningRate(step, 10, lr)

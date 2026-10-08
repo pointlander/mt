@@ -27,6 +27,8 @@ GOEXPERIMENT=simd go run . -steps 200 -lr 1e-3
 
 `-gutenberg N` reads the first N regular `.txt` members of the tar stored in `txt-files.tar.zip`, in archive order, and concatenates them with no separator. That archive is not in this repository. The run is one pass over non-overlapping windows. With the default context and group of 1000, each stride-aligned training position is a target once. `-steps` does not set the length of that pass. A thousand books is a few hours.
 
+The same pass then trains on `train-v2.0.json` (SQuAD 2.0). Each example is the article title, the paragraph, the question, and the answer. Impossible questions use the answer `unanswerable`. The whole file is training text. The 90/10 split stays on the books, and the held-out score is still that book suffix.
+
 ```bash
 GOEXPERIMENT=simd go run . -gutenberg 1000
 ```
@@ -82,7 +84,7 @@ The printed bits/byte is the negative log probability of the drawn bytes, in bit
 | `-gen` | 32 | Bytes to generate from `-prompt` |
 | `-sims` | 1 | Softmax samples for the `mcts` line; the last one is printed |
 | `-temp` | 1 | Softmax temperature for generation |
-| `-gutenberg` | 0 | One-shot train on the first N books in `txt-files.tar.zip` |
+| `-gutenberg` | 0 | One-shot train on the first N books in `txt-files.tar.zip` and on `train-v2.0.json` |
 
 ## License
 

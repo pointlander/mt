@@ -158,4 +158,16 @@ func TestOneShotTrainFinite(t *testing.T) {
 	if math.IsNaN(loss) || math.IsInf(loss, 0) || loss <= 0 {
 		t.Fatalf("loss %g", loss)
 	}
+
+	other := bytes.Repeat([]byte("xyzzzy question answer "), 40)
+	m.Train(other, len(other))
+	sumsB := buildGroupSums(m, other, cfg.Group)
+	startsB := oneShotStarts(len(other), len(other), cfg.Context, cfg.Group, stride)
+	loss = oneShotTrainSegs(w, cfg, m, []shotSeg{
+		{sums: sums, data: data, starts: starts[:2]},
+		{sums: sumsB, data: other, starts: startsB[:1]},
+	}, 2, 1e-3)
+	if math.IsNaN(loss) || math.IsInf(loss, 0) || loss <= 0 {
+		t.Fatalf("two-seg loss %g", loss)
+	}
 }
